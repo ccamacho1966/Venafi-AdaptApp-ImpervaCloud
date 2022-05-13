@@ -3,7 +3,7 @@
 #
 # CCamacho Template Driver Version: 202006101700
 #
-$Script:AdaptableAppVer = '202205121743'
+$Script:AdaptableAppVer = '202205131530'
 $Script:AdaptableAppDrv = "Imperva Cloud WAF"
 
 # Import Legacy Imperva sites?
@@ -193,17 +193,17 @@ function Extract-Certificate
         $siteThumb  = $siteCert.X509.Thumbprint.TrimStart('0')
     }
 
-    if ($siteSerial -eq $null) {
+    if ($null -eq $siteSerial) {
         Write-VenDebugLog "No serial number retrieved from Imperva Cloud WAF"
         throw("Serial Number not available from Imperva Cloud WAF");
     }
 
-    if ($siteThumb -eq $null) {
+    if ($null -eq $siteThumb) {
         Write-VenDebugLog "No fingerprint retrieved from Imperva Cloud WAF"
         throw("Fingerprint not available from Imperva Cloud WAF");
     }
 
-    if ($siteInfo.ssl.custom_certificate.expirationDate -eq $null) {
+    if ($null -eq $siteInfo.ssl.custom_certificate.expirationDate) {
         Write-VenDebugLog "No expiration date retrieved from Imperva Cloud WAF"
         throw("Expiration date not available from Imperva Cloud WAF");
     } else {
@@ -256,42 +256,33 @@ function Discover-Certificates
     $started=Get-Date
 
     Initialize-VenDebugLog -General $General
+
 #    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls12
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-    $wafId  =$General.UserName
-    $wafKey =$General.UserPass
     $apiUrl ="https://my.imperva.com/api/prov/v1/sites/list"
-    $apiAuth=@{'x-API-Id'=$wafId; 'x-API-Key'=$wafKey}
 
     if (($General.HostAddress -eq '') -or ($General.HostAddress -eq '*')) {
-        $wafAccount="*"
+        $wafAccount='*'
     }
     else {
         $wafAccount=$General.HostAddress
-#        Write-VenDebugLog "Imperva Account: [$($WafAccount)]"
     }
 
-#    Write-VenDebugLog "Imperva API ID:  [$($wafId)]"
-#    Write-VenDebugLog "Imperva API Key: [$($wafKey)]"
-#    Write-VenDebugLog "Imperva API URL: [$($apiUrl)]"
     if ($General.AuxUser -gt 9) {
         $wafLegacy = $General.AuxUser
-    Write-VenDebugLog "Legacy Import?:  YES ($($wafLegacy) days)"
+        Write-VenDebugLog "Legacy Import?:  YES ($($wafLegacy) days)"
     }
     else {
         $wafLegacy = $null
     }
 
-    $siteList=@()
-
-    # How many sites to pull per API call
-    # 10 is a reasonably small/quick chunk
+    # How many sites to pull per API call - 10 is a reasonably small/quick chunk
     # maximum supported by Imperva is 100
     $psize=10
 
-    # Initialize Counters to 0
+    # Initialize counters, arrays, lists
     $page=$siteCount=$skipped=$sslSites=$sslFree=$sslLegacyIgnored=$sslLegacyAdded=$sslDiscovered=$inactiveSites=$errorSites=0
+    $siteList=@()
 
     do {
         $batch=0
@@ -341,12 +332,12 @@ function Discover-Certificates
                     else {
                         foreach($entry in $site.dns) {
                             if ($entry.dns_record_name -eq $site.display_name) {
-                                if (($site.ssl.custom_certificate.serialNumber -eq $null) -and ($Script:ImportLegacy -ne $true)) {
+                                if (($null -eq $site.ssl.custom_certificate.serialNumber) -and ($Script:ImportLegacy -ne $true)) {
                                     Write-VenDebugLog "Ignored: $($site.display_name) is a legacy SSL site"
                                     $sslLegacyIgnored++
                                 } # legacy site - no serial/thumbprint
                                 else {
-                                    if ($site.ssl.custom_certificate.serialNumber -eq $null) {
+                                    if ($null -eq $site.ssl.custom_certificate.serialNumber) {
                                         $sslLegacyAdded++
                                         Write-VenDebugLog "Discovered: [$($site.display_name)] (Legacy Site #$($site.site_id) at $($entry.set_data_to[0]))"
                                     }
@@ -355,7 +346,7 @@ function Discover-Certificates
                                         Write-VenDebugLog "Discovered: [$($site.display_name)] (Site #$($site.site_id) at $($entry.set_data_to[0]))"
                                     }
                                     $siteCert = Get-CertFromWaf -WafHost $entry.set_data_to[0] -Target $site.display_name
-                                    if ($site.ssl.custom_certificate.serialNumber -eq $null) {
+                                    if ($null -eq $site.ssl.custom_certificate.serialNumber) {
                                         $siteSerial=($siteCert.X509.SerialNumber.TrimStart('0'))
                                         $siteThumb=($siteCert.X509.Thumbprint.TrimStart('0'))
                                     } # Spoof API for Legacy site
@@ -363,10 +354,8 @@ function Discover-Certificates
                                         $siteSerial=($site.ssl.custom_certificate.serialNumber -replace ':','')
                                         $siteThumb=($site.ssl.custom_certificate.fingerPrint -replace 'SHA1 Fingerprint=','' -replace ':','')
                                     } # Read/Use serial number and thumbprint provided by API
-#                                    Write-VenDebugLog "\\-- Common Name:   [$($siteCert.X509.GetNameInfo(0,$false))]"
-#                                    Write-VenDebugLog "\\-- Issuer (CA):   [$($siteCert.X509.GetNameInfo(0,$true))]"
                                     Write-VenDebugLog "Certificate '$($siteCert.X509.GetNameInfo(0,$false))' issued by '$($siteCert.X509.GetNameInfo(0,$true))'"
-                                    if (($site.ssl.custom_certificate.serialNumber -ne $null) -and (($siteCert.X509.SerialNumber.TrimStart('0') -ne $siteSerial.TrimStart('0')) -or ($siteCert.X509.Thumbprint.TrimStart('0') -ne $siteThumb.TrimStart('0')))) {
+                                    if (($null -ne $site.ssl.custom_certificate.serialNumber) -and (($siteCert.X509.SerialNumber.TrimStart('0') -ne $siteSerial.TrimStart('0')) -or ($siteCert.X509.Thumbprint.TrimStart('0') -ne $siteThumb.TrimStart('0')))) {
                                         # This is a pretty annoying bug for wildcard users
                                         # Every site retains its own certificate details...
                                         # ...BUT uploading a wildcard on any site affects all
@@ -394,11 +383,11 @@ function Discover-Certificates
                                         ValidationPort = 443           # TCP port (Currently hard coded to 443)
                                         Attributes = @{
                                             "Text Field 1" = "$($site.site_id)"
-    #                                        "Text Field 2" = ""
-    #                                        "Text Field 3" = ""
-    #                                        "Text Field 4" = ""
-    #                                        "Text Field 5" = ""
-    #                                        "Certificate Name" = ""
+#                                            "Text Field 2" = ""
+#                                            "Text Field 3" = ""
+#                                            "Text Field 4" = ""
+#                                            "Text Field 5" = ""
+#                                            "Certificate Name" = ""
                                         }
                                     } # Venafi Application definition for the current site
                                     $siteList += $wafSite
@@ -456,7 +445,7 @@ function Write-VenDebugLog
     filter Add-TS {"$(Get-Date -Format o): $_"}
 
     # if the logfile isn't initialized then do nothing and return immediately
-    if ($Script:venDebugFile -eq $null) { return }
+    if ($null -eq $Script:venDebugFile) { return }
 
     if ($NoFunctionTag.IsPresent) {
         $taggedLog = $LogMessage
@@ -475,15 +464,17 @@ function Initialize-VenDebugLog
         [Parameter(Position=0, Mandatory)][System.Collections.Hashtable]$General
     )
 
-    if ($Script:venDebugFile -ne $null) {
+    # if the debugfile is already setup we shouldn't be called again - log a warning
+    if ($null -ne $Script:venDebugFile) {
         Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
         Write-VenDebugLog 'WARNING: Initialize-VenDebugLog() called more than once!'
         return
     }
 
-    if ($DEBUG_FILE -eq $null) {
+    if ($null -eq $DEBUG_FILE) {
         # do nothing and return immediately if debug isn't on
         if ($General.VarBool1 -eq $false) { return }
+
         # pull Venafi base directory from registry for global debug flag
         $logPath = "$((Get-ItemProperty HKLM:\Software\Venafi\Platform).'Base Path')Logs"
     }
@@ -492,6 +483,7 @@ function Initialize-VenDebugLog
         $logPath = "$(Split-Path -Path $DEBUG_FILE)"
     }
 
+    # add a filename to the base log directory path
     $Script:venDebugFile = "$($logPath)\$($Script:AdaptableAppDrv.Replace(' ',''))"
     if ($General.HostAddress -ne '') {
         $Script:venDebugFile += "-Acct$($General.HostAddress)"
@@ -564,7 +556,7 @@ function Get-ImpervaErrorMessage
         '9415'='The requested operation is not allowed'
     }
 
-    if ($ImpervaError[$Code] -eq $null) {
+    if ($null -eq $ImpervaError[$Code]) {
         return "Unknown Imperva Error Code: $($Code)"
     }
 
@@ -580,33 +572,31 @@ function Get-CertFromWaf
     )
 
     Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
-
-    $wafUri = "https://$($WafHost):$($Port)"
-
     Write-VenDebugLog "Pulling certificate for $($Target) via front-end $($WafHost)"
 
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls12
+    $wafUri = "https://$($WafHost):$($Port)"
 
     try {
-        # We're not parsing the webpage so '-UseBasicParsing' helps
-        # prevent meaningless IE setup errors messages here...
+        # open a network connection to the Imperva front-end. Be sure to pass the proper host request header!
+        # We're not parsing the webpage so '-UseBasicParsing' helps prevent meaningless IE setup errors messages...
         Invoke-WebRequest -Uri "$($wafUri)" -Headers @{Host="$($Target)"} -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop | Out-Null
     }
     catch {
-        # Log the error but keep on trucking...
-        # We only want the TLS handshake anyway.
+        # Log the error but keep on trucking... We only want the TLS handshake anyway.
         Write-VenDebugLog "Get-CertFromWaf Error: $($_) (ignoring)"
     }
 
+    # find the open network connection then import the raw certificate data 
     $sp = [System.Net.ServicePointManager]::FindServicePoint("$($wafUri)")
-
     $wafCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2
     $wafCert.Import($sp.Certificate.GetRawCertData())
 
+    # create a base-64 formatted string from the certificate (aka PEM data format)
     $pemData = [Convert]::ToBase64String($wafCert.GetRawCertData(),'InsertLineBreaks')
-
     $FormattedPEM = "-----BEGIN CERTIFICATE-----`n$($pemData)`n-----END CERTIFICATE-----"
 
+    # build an object that contains both the certificate object and PEM string data
     $results = @{
         X509   = $wafCert
         PEM    = $FormattedPem

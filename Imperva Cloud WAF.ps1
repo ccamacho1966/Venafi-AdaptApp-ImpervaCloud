@@ -3,7 +3,7 @@
 #
 # CCamacho Template Driver Version: 202006101700
 #
-$Script:AdaptableAppVer = '202205131530'
+$Script:AdaptableAppVer = '202206081045'
 $Script:AdaptableAppDrv = "Imperva Cloud WAF"
 
 # Import Legacy Imperva sites?
@@ -110,6 +110,10 @@ function Install-Certificate
     if ($siteInfo.res -ne 0) {
         $apiError=Get-ImpervaErrorMessage -Code $siteInfo.res
         Write-VenDebugLog "API error: $($apiError): $($siteInfo.debug_info.Error)"
+        if ($siteInfo.res -eq 3015) {
+            Write-VenDebugLog "Temporary Error - Returning control to Venafi (Resume Later)"
+            return @{ Result="ResumeLater"; }
+        }
         Write-VenDebugLog "Install FAILED - Returning control to Venafi"
         throw "API error: $($apiError): $($siteInfo.debug_info.Error)"
     }
@@ -516,13 +520,23 @@ function Invoke-ImpervaRestMethod
         'x-API-Key' = $General.UserPass
     }
 
-    try {
-        $response = Invoke-RestMethod -Uri $Uri -Method $Method -Headers $apiAuth -Body $Body -ContentType $ContentType -TimeoutSec $TimeoutSec
-    }
-    catch {
-        Write-VenDebugLog "REST call failed to '$($Uri)'"
-		throw $_
-    }
+    $Attempts=3
+    $i=0
+    do {
+        try {
+            $response = Invoke-RestMethod -Uri $Uri -Method $Method -Headers $apiAuth -Body $Body -ContentType $ContentType -TimeoutSec $TimeoutSec
+        }
+        catch {
+            Write-VenDebugLog "REST call failed to '$($Uri)'"
+            throw $_
+        }
+        # 3015 signifies a temporary error "please try again"
+        if ($response.res -ne 3015) { return $response }
+        $i++
+        $wait = Get-Random -Minimum ($i+1) -Maximum ($i*3)
+        Write-VenDebugLog "Attempt #$($i) soft failure ($($response.debug_info.Error)) - sleeping for $($wait) seconds"
+        Start-Sleep -Seconds $wait
+    } while ($i -lt $Attempts)
 
     $response
 }

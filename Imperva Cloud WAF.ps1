@@ -3,7 +3,7 @@
 #
 # CCamacho Template Driver Version: 202006101700
 #
-$Script:AdaptableAppVer = '202206081045'
+$Script:AdaptableAppVer = '202208081325'
 $Script:AdaptableAppDrv = "Imperva Cloud WAF"
 
 # Import Legacy Imperva sites?
@@ -159,7 +159,6 @@ function Extract-Certificate
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
     $siteId=$General.VarText1
-
     Write-VenDebugLog "Imperva Site #$($siteId)"
 
     $apiUrl="https://my.imperva.com/api/prov/v1/sites/status"
@@ -186,37 +185,10 @@ function Extract-Certificate
         }
     }
 
-    $siteSerial=($siteInfo.ssl.custom_certificate.serialNumber -replace ':','')
-    $siteThumb=($siteInfo.ssl.custom_certificate.fingerPrint -replace 'SHA1 Fingerprint=','' -replace ':','')
-
-    if (($Script:ImportLegacy -eq $true) -and ($siteSerial -eq '')) {
-        Write-VenDebugLog "Legacy Site: Pulling serial number and thumbprint from WAF front-end (API spoof)"
-        $siteCert = Get-CertFromWaf -WafHost $wafHost -Target $siteInfo.domain
-
-        $siteSerial = $siteCert.X509.SerialNumber.TrimStart('0')
-        $siteThumb  = $siteCert.X509.Thumbprint.TrimStart('0')
-    }
-
-    if ($null -eq $siteSerial) {
-        Write-VenDebugLog "No serial number retrieved from Imperva Cloud WAF"
-        throw("Serial Number not available from Imperva Cloud WAF");
-    }
-
-    if ($null -eq $siteThumb) {
-        Write-VenDebugLog "No fingerprint retrieved from Imperva Cloud WAF"
-        throw("Fingerprint not available from Imperva Cloud WAF");
-    }
-
-    if ($null -eq $siteInfo.ssl.custom_certificate.expirationDate) {
-        Write-VenDebugLog "No expiration date retrieved from Imperva Cloud WAF"
-        throw("Expiration date not available from Imperva Cloud WAF");
-    } else {
-        $certExpires=Convert-ImpervaTimestamp $siteInfo.ssl.custom_certificate.expirationDate
-        Write-VenDebugLog "Certificate Valid Until $($certExpires)"
-    }
+    $customCert = Get-ImpervaCustomCertificate -General $General -Website $siteId
 
     Write-VenDebugLog "Extracted Thumbprint and Serial Number - Returning control to Venafi"
-    return @{ Result="Success"; Serial=$siteSerial; Thumbprint=$siteThumb }
+    return @{ Result="Success"; Serial=$($customCert.serialNumber); Thumbprint=$($customCert.fingerprint) }
 }
 
 function Extract-PrivateKey
@@ -577,6 +549,101 @@ function Get-ImpervaErrorMessage
     $ImpervaError[$Code]
 }
 
+function Get-ImpervaCustomCertificate
+{
+    Param(
+        [Parameter(Mandatory)] [System.Collections.Hashtable] $General,
+        [Parameter(Mandatory)] [PSCustomObject] $Website
+    )
+
+    $siteId     = $Website.site_id
+    $siteLegacy = $false
+    $apiUrl     = "https://api.imperva.com/certificates/v3/certificates?extSiteId=$($siteId)&certType=CUSTOM_CERT"
+
+    try {
+        $response   = Invoke-ImpervaRestMethod -General $General -Uri $apiUrl -Method Get
+    }
+    catch {
+        $fatal = "Failed to retrieve custom certificate data: $($_)"
+        Write-VenDebugLog $fatal
+        throw $fatal
+    }
+
+    if ($response.errors.status) {
+        $fatal = "Imperva API threw an error for site #$($Website.site_id): $($response.errors.detail)"
+        Write-VenDebugLog $fatal
+        throw $fatal
+    }
+
+    if ($response.data.id -ne $siteId) {
+        $fatal = "Data Mismatch! Asked for site #$() but got results for site #$()..."
+        Write-VenDebugLog $fatal
+        throw $fatal
+    }
+
+    $siteSerial  = ($response.data.customCertificateDetails.serialNumber -replace ':','')
+    $siteThumb   = ($response.data.customCertificateDetails.fingerprint -replace 'SHA1 Fingerprint=','' -replace ':','')
+    $certExpires = Convert-ImpervaTimestamp "$($response.data.expirationDate)"
+
+    # Always attempt to pull the public certificate from the WAF front-end
+    # This is as much to generate warnings for API bugs as it is to support discovery
+    $siteCert = Get-CertFromWaf -WafHost $wafHost -Target $siteInfo.domain
+
+    if (($null -eq $siteSerial) -or ($siteSerial -eq '')) {
+        $siteLegacy = $true
+        $siteSerial = $siteCert.X509.SerialNumber.TrimStart('0')
+        $siteThumb  = $siteCert.X509.Thumbprint.TrimStart('0')
+    }
+
+    if (($null -eq $siteThumb) -or ($siteThumb -eq '')) {
+        Write-VenDebugLog "No fingerprint retrieved from Imperva Cloud WAF"
+        throw("Fingerprint not available from Imperva Cloud WAF");
+    }
+
+    if ($null -eq $response.data.expirationDate) {
+        Write-VenDebugLog "No expiration date retrieved from Imperva Cloud WAF"
+        throw("Expiration date not available from Imperva Cloud WAF");
+    }
+
+    if ($null -ne $siteCert) {
+        Write-VenDebugLog "Certificate '$($siteCert.X509.GetNameInfo(0,$false))' issued by '$($siteCert.X509.GetNameInfo(0,$true))'"
+        if (($null -ne $response.data.customCertificateDetails.serialNumber) -and (($siteCert.X509.SerialNumber.TrimStart('0') -ne $response.data.customCertificateDetails.serialNumber.TrimStart('0')) -or ($siteCert.X509.Thumbprint.TrimStart('0') -ne $response.data.customCertificateDetails.fingerprint.TrimStart('0')))) {
+            # This is a pretty annoying bug...
+            #
+            # If you use a certificate on multiple WAF sites (I.E. SANs or wildcards)
+            # then you should know that every site tracks details based on a site-specific upload
+            # Every site retains its own certificate details...
+            # ...BUT uploading a shared certificate on any site actually affects all the others on
+            # the backend. To make the saved data validate, you have to upload the certificate to
+            # each and every site. This bug also can be seen in the web UI.
+            #
+            # This is silly, BUT we should at least flag/note this in the debug logs.
+            Write-VenDebugLog "WARNING: Imperva Bug - Certificate Mismatch in API vs WAF - Validation will FAIL"
+            Write-VenDebugLog "\\-- API: Serial=$($siteSerial), Thumbprint=$($siteThumb)"
+            Write-VenDebugLog "\\-- WAF: Serial=$($siteCert.X509.SerialNumber), Thumbprint=$($siteCert.X509.Thumbprint)"
+            Write-VenDebugLog "\\-- Reinstall certificate via API or WebUI to fix this issue"
+        } # UI/WAF mismatch warning
+    }
+
+    Write-VenDebugLog "Serial=$($siteSerial), Thumbprint=$($siteThumb)"
+
+    if ($response.data.customCertificateDetails.hasMismatchSite -eq $true) {
+        Write-VenDebugLog 'WARNING: Imperva reports a "site mismatch" error... The certificate does not match the site name!'
+    }
+
+    Write-VenDebugLog "Certificate Valid Until $($certExpires)"
+
+    $certData = @{
+        "site_id"      = $siteId
+        "serialNumber" = $siteSerial
+        "fingerprint"  = $siteThumb
+        "certExpires"  = $certExpires
+        "legacy"       = $siteLegacy
+    }
+
+    $certData
+}
+
 function Get-CertFromWaf
 {
     Param(
@@ -598,7 +665,7 @@ function Get-CertFromWaf
     }
     catch {
         # Log the error but keep on trucking... We only want the TLS handshake anyway.
-        Write-VenDebugLog "Get-CertFromWaf Error: $($_) (ignoring)"
+        Write-VenDebugLog "Ignoring Error: $($_)"
     }
 
     # find the open network connection then import the raw certificate data 

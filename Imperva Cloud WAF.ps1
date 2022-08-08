@@ -3,7 +3,7 @@
 #
 # CCamacho Template Driver Version: 202006101700
 #
-$Script:AdaptableAppVer = '202208081429'
+$Script:AdaptableAppVer = '202208081912'
 $Script:AdaptableAppDrv = "Imperva Cloud WAF"
 
 # Import Legacy Imperva sites?
@@ -178,13 +178,6 @@ function Extract-Certificate
         throw $apiError
     }
 
-    foreach ($dnsBlock in $siteInfo.dns) {
-        if ($dnsBlock.dns_record_name -eq $siteInfo.domain) {
-            $wafHost = $dnsBlock.set_data_to[0]
-            Write-VenDebugLog "Imperva Site $($siteInfo.domain) uses front-end $($wafHost)"
-        }
-    }
-
     $customCert = Get-ImpervaCustomCertificate -General $General -Website $siteInfo
 
     Write-VenDebugLog "Extracted Thumbprint and Serial Number - Returning control to Venafi"
@@ -244,20 +237,12 @@ function Discover-Certificates
         $wafAccount=$General.HostAddress
     }
 
-    if ($General.AuxUser -gt 9) {
-        $wafLegacy = $General.AuxUser
-        Write-VenDebugLog "Legacy Import?:  YES ($($wafLegacy) days)"
-    }
-    else {
-        $wafLegacy = $null
-    }
-
     # How many sites to pull per API call - 10 is a reasonably small/quick chunk
     # maximum supported by Imperva is 100
     $psize=10
 
     # Initialize counters, arrays, lists
-    $page=$siteCount=$skipped=$sslSites=$sslFree=$sslLegacyIgnored=$sslLegacyAdded=$sslDiscovered=$inactiveSites=$errorSites=0
+    $page=$siteCount=$skipped=$sslSites=$sslFree=$sslLegacyIgnored=$sslLegacyAdded=$sslDiscovered=$inactiveSites=0
     $siteList=@()
 
     do {
@@ -287,91 +272,37 @@ function Discover-Certificates
                 $skipped++
                 Write-VenDebugLog "Ignored: $($site.display_name) in sub-account #$($site.account_id)"
             }
+            elseif ($site.active -ne 'active') {
+                # This site is NOT active...
+                $inactiveSites++
+                Write-VenDebugLog "Ignored: $($site.display_name) is inactive"
+            }
             else {
-                if ($site.ssl.custom_certificate.active -eq $true) {
-                    $siteError=''
+                $customCert = Get-ImpervaCustomCertificate -General $General -Website $site
+                if ($customCert) {
+                    $wafHost = $customCert.wafHost
                     $sslSites++
-                    if ($site.ssl.custom_certificate.hostnameMismatchError -eq $true) {
-                        $siteError += 'Hostname Mismatch, '
+                    if ($customCert.legacy) {
+                        $sslLegacyAdded++
+                        Write-VenDebugLog "Discovered: [$($site.display_name)] (Legacy Site #$($site.site_id) at $($wafHost))"
                     }
-                    if ($site.ssl.custom_certificate.validityError -eq $true) {
-                        $siteError += 'Validity, '
-                    }
-                    if ($site.active -ne 'active') {
-                        $inactiveSites++
-                        Write-VenDebugLog "Ignored: $($site.display_name) is inactive"
-                    } # site is NOT active
-                    elseif ($siteError -ne '') {
-                        $errorSites++
-                        Write-VenDebugLog "Ignored: $($site.display_name) has errors ($($siteError.TrimEnd(' ,')))"
-                    } # certificate has errors
                     else {
-                        foreach($entry in $site.dns) {
-                            if ($entry.dns_record_name -eq $site.display_name) {
-                                if (($null -eq $site.ssl.custom_certificate.serialNumber) -and ($Script:ImportLegacy -ne $true)) {
-                                    Write-VenDebugLog "Ignored: $($site.display_name) is a legacy SSL site"
-                                    $sslLegacyIgnored++
-                                } # legacy site - no serial/thumbprint
-                                else {
-                                    if ($null -eq $site.ssl.custom_certificate.serialNumber) {
-                                        $sslLegacyAdded++
-                                        Write-VenDebugLog "Discovered: [$($site.display_name)] (Legacy Site #$($site.site_id) at $($entry.set_data_to[0]))"
-                                    }
-                                    else {
-                                        $sslDiscovered++
-                                        Write-VenDebugLog "Discovered: [$($site.display_name)] (Site #$($site.site_id) at $($entry.set_data_to[0]))"
-                                    }
-                                    $siteCert = Get-CertFromWaf -WafHost $entry.set_data_to[0] -Target $site.display_name
-                                    if ($null -eq $site.ssl.custom_certificate.serialNumber) {
-                                        $siteSerial=($siteCert.X509.SerialNumber.TrimStart('0'))
-                                        $siteThumb=($siteCert.X509.Thumbprint.TrimStart('0'))
-                                    } # Spoof API for Legacy site
-                                    else {
-                                        $siteSerial=($site.ssl.custom_certificate.serialNumber -replace ':','')
-                                        $siteThumb=($site.ssl.custom_certificate.fingerPrint -replace 'SHA1 Fingerprint=','' -replace ':','')
-                                    } # Read/Use serial number and thumbprint provided by API
-                                    Write-VenDebugLog "Certificate '$($siteCert.X509.GetNameInfo(0,$false))' issued by '$($siteCert.X509.GetNameInfo(0,$true))'"
-                                    if (($null -ne $site.ssl.custom_certificate.serialNumber) -and (($siteCert.X509.SerialNumber.TrimStart('0') -ne $siteSerial.TrimStart('0')) -or ($siteCert.X509.Thumbprint.TrimStart('0') -ne $siteThumb.TrimStart('0')))) {
-                                        # This is a pretty annoying bug for wildcard users
-                                        # Every site retains its own certificate details...
-                                        # ...BUT uploading a wildcard on any site affects all
-                                        # To make the info "look" right you have to upload the
-                                        # wildcard to each and every site which is silly...
-                                        #
-                                        # ...BUT we should at least flag/note this in the logs.
-                                        Write-VenDebugLog "WARNING: Imperva Bug - Certificate Mismatch in API vs WAF - Validation will FAIL"
-                                        Write-VenDebugLog "\\-- API: Serial=$($siteSerial) Thumbprint=$($siteThumb)"
-                                        Write-VenDebugLog "\\-- WAF: Serial=$($siteCert.X509.SerialNumber) Thumbprint=$($siteCert.X509.Thumbprint)"
-                                        Write-VenDebugLog "\\-- Reinstall certificate via API or WebUI to fix this issue"
-                                    } # UI/WAF mismatch warning
-#                                    else {
-#                                        Write-VenDebugLog "\\-- Serial Number: [$($siteSerial)]"
-#                                        Write-VenDebugLog "\\-- Thumbprint:    [$($siteThumb)]"
-#                                    }
-                                    if ($site.ssl.custom_certificate.chainError -eq $true) {
-                                        Write-VenDebugLog 'WARNING: Imperva reports a "chain error" for this certificate...'
-                                    }
-                                    $wafSite = @{
-                                        Name = "$($site.display_name)" # Name of the Adaptable Application object
-                                        PEM = $siteCert.PEM            # Formatted PEM version of the public certificate
-                                        # Venafi currently fails when trying to validate this way ... SNI issue..?
-                                        ValidationAddress = "$($entry.set_data_to[0])" # FQDN of Imperva WAF Front-End
-                                        ValidationPort = 443           # TCP port (Currently hard coded to 443)
-                                        Attributes = @{
-                                            "Text Field 1" = "$($site.site_id)"
-#                                            "Text Field 2" = ""
-#                                            "Text Field 3" = ""
-#                                            "Text Field 4" = ""
-#                                            "Text Field 5" = ""
-#                                            "Certificate Name" = ""
-                                        }
-                                    } # Venafi Application definition for the current site
-                                    $siteList += $wafSite
-                                } # API returned serial & thumbprint
-                            } # dns_record_name entry matches site_name
-                        } # foreach $site.dns entry
-                    } # else ... site is active
-                } # $site.ssl.custom_certificate.active TRUE
+                        $sslDiscovered++
+                        Write-VenDebugLog "Discovered: [$($site.display_name)] (Site #$($site.site_id) at $($wafHost))"
+                    }
+                    $wafSite = @{
+                        Name = "$($site.display_name)"      # Name of the Adaptable Application object
+                        PEM = $customCert.certificate.PEM   # Formatted PEM version of the public certificate
+                        # Venafi currently fails when trying to validate this way due to weak SNI support
+                        ValidationAddress = $wafHost        # FQDN of Imperva WAF Front-End
+                        ValidationPort = 443                # TCP port (Currently hard coded to 443)
+                        Attributes = @{
+                            "Text Field 1" = "$($site.site_id)"
+#                           "Certificate Name" = ""
+                        }
+                    } # Venafi Application definition for the current site
+                    $siteList += $wafSite
+                } # custom certificate was retrieved
                 else {
                     $sslFree++
                     Write-VenDebugLog "Ignored: $($site.display_name) is unencrypted"
@@ -388,11 +319,10 @@ function Discover-Certificates
         }
         Write-VenDebugLog $logMessage
     }
-    if ($sslLegacyIgnored+$errorSites+$sslFree+$inactiveSites+$skipped -gt 0) {
-        $logMessage = "Ignored $($sslLegacyIgnored+$errorSites+$sslFree+$inactiveSites+$skipped) sites ("
+    if ($sslLegacyIgnored+$sslFree+$inactiveSites+$skipped -gt 0) {
+        $logMessage = "Ignored $($sslLegacyIgnored+$sslFree+$inactiveSites+$skipped) sites ("
         if ($sslFree -gt 0)          { $logMessage += "$($sslFree) unencrypted, " }
         if ($sslLegacyIgnored -gt 0) { $logMessage += "$($sslLegacyIgnored) legacy, " }
-        if ($errorSites -gt 0)       { $logMessage += "$($errorSites) cert errors, " }
         if ($inactiveSites -gt 0)    { $logMessage += "$($inactiveSites) inactive, " }
         if ($skipped -gt 0)          { $logMessage += "$($skipped) sub-account sites" }
         Write-VenDebugLog "$($logMessage.TrimEnd(', ')))"
@@ -559,8 +489,16 @@ function Get-ImpervaCustomCertificate
     Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
 
     $siteId     = $Website.site_id
+    $siteName   = $Website.display_name
     $siteLegacy = $false
     $apiUrl     = "https://api.imperva.com/certificates/v3/certificates?extSiteId=$($siteId)&certType=CUSTOM_CERT"
+
+    foreach ($dnsBlock in $Website.dns) {
+        if ($dnsBlock.dns_record_name -eq $Website.domain) {
+            $wafHost = $dnsBlock.set_data_to[0]
+            Write-VenDebugLog "Imperva Site $($Website.display_name) uses front-end $($wafHost)"
+        }
+    }
 
     try {
         $response   = Invoke-ImpervaRestMethod -General $General -Uri $apiUrl -Method Get
@@ -571,14 +509,26 @@ function Get-ImpervaCustomCertificate
         throw $fatal
     }
 
+    # This should only happen during discovery of an unencrypted site
+    if ($response.data.Count -eq 0) {
+#        Write-VenDebugLog "No custom certificate found for $($siteName) (site #$($siteId))"
+        return $null
+    }
+    # Getting back more than 1 result should NEVER happen...
+    elseif ($response.data.Count -ne 1) {
+        $fatal = "Custom certificate count is $($response.data.Count)... This should never happen!"
+        Write-VenDebugLog $fatal
+        throw $fatal
+    }
+
     if ($response.errors.status) {
-        $fatal = "Imperva API threw an error for site #$($Website.site_id): $($response.errors.detail)"
+        $fatal = "Imperva API threw an error for $($siteName) (site #$($siteId)): $($response.errors.status) $($response.errors.detail)"
         Write-VenDebugLog $fatal
         throw $fatal
     }
 
     if ($response.data.extSiteId -ne $siteId) {
-        $fatal = "Data Mismatch! Asked for site #$($siteId) but got results for site #$($response.data.extSiteId)..."
+        $fatal = "Data Mismatch! Asked for $($siteName) (site #$($siteId)) but got results for site #$($response.data.extSiteId)..."
         Write-VenDebugLog $fatal
         throw $fatal
     }
@@ -587,31 +537,43 @@ function Get-ImpervaCustomCertificate
     $siteThumb   = $apiThumb  = ($response.data.customCertificateDetails.fingerprint -replace 'SHA1 Fingerprint=','' -replace ':','')
     $certExpires = Convert-ImpervaTimestamp "$($response.data.expirationDate)"
 
+    # Imperva will only return data for valid/active certificates... plus the front-end won't work right!
+    # This is an attempt to handle the unexpected results for expired/inactive certificates
+    $GoodImpervaStatus = @('ACTIVE','NEAR_EXPIRATION')
+    if ($response.data.status -eq 'EXPIRED') {
+        Write-VenDebugLog "EXPIRED: Certificate for $($siteName) (site #$($siteId)) expired on $($certExpires)"
+        return $null
+    }
+    elseif ($response.data.status -notin $GoodImpervaStatus) {
+        Write-VenDebugLog "ERROR: Unexpected certificate status '$($response.data.status)' for $($siteName) (site #$($siteId))"
+        return $null
+    }
+
     # Always attempt to pull the public certificate from the WAF front-end
     # This is as much to generate warnings for API bugs as it is to support discovery
-    $siteCert = Get-CertFromWaf -WafHost $wafHost -Target $siteInfo.domain
+    $siteCert = Get-CertFromWaf -WafHost $wafHost -Target $Website.domain
 
     if (($null -eq $siteSerial) -or ($siteSerial -eq '')) {
         $siteLegacy = $true
-        Write-VenDebugLog 'Legacy website: Certificate data not available via API'
+        Write-VenDebugLog "Legacy website: Certificate data not available via API for $($siteName) (site #$($siteId))"
         $siteSerial = $siteCert.X509.SerialNumber.TrimStart('0')
         $siteThumb  = $siteCert.X509.Thumbprint.TrimStart('0')
     }
 
     if (($null -eq $siteThumb) -or ($siteThumb -eq '')) {
-        Write-VenDebugLog "No fingerprint retrieved from Imperva Cloud WAF"
+        Write-VenDebugLog "No fingerprint retrieved from Imperva Cloud WAF for $($siteName) (site #$($siteId)) - $($siteThumb)"
         throw("Fingerprint not available from Imperva Cloud WAF");
     }
 
     if ($null -eq $response.data.expirationDate) {
-        Write-VenDebugLog "No expiration date retrieved from Imperva Cloud WAF"
+        Write-VenDebugLog "No expiration date retrieved from Imperva Cloud WAF for $($siteName) (site #$($siteId))"
         throw("Expiration date not available from Imperva Cloud WAF");
     }
 
     if ($null -ne $siteCert) {
         Write-VenDebugLog "Certificate '$($siteCert.X509.GetNameInfo(0,$false))' issued by '$($siteCert.X509.GetNameInfo(0,$true))'"
-        if ($null -ne $response.data.customCertificateDetails.serialNumber) {
-            if (($siteCert.X509.SerialNumber.TrimStart('0') -ne $apiSerial) -or ($siteCert.X509.Thumbprint.TrimStart('0') -ne $apiThumb)) {
+        if (!$siteLegacy) {
+            if (($siteCert.X509.SerialNumber.TrimStart('0') -ne $apiSerial.TrimStart('0')) -or ($siteCert.X509.Thumbprint.TrimStart('0') -ne $apiThumb.TrimStart('0'))) {
                 # This is a pretty annoying bug...
                 #
                 # If you use a certificate on multiple WAF sites (I.E. SANs or wildcards)
@@ -623,11 +585,11 @@ function Get-ImpervaCustomCertificate
                 #
                 # This is silly, BUT we should at least flag/note this in the debug logs.
                 Write-VenDebugLog "WARNING: Imperva Bug - Certificate Mismatch in API vs WAF - Validation will FAIL"
-                Write-VenDebugLog "\\-- API: Serial=$($response.data.customCertificateDetails.serialNumber), Thumbprint=$($response.data.customCertificateDetails.fingerprint)"
+                Write-VenDebugLog "\\-- API: Serial=$($apiSerial), Thumbprint=$($apiThumb)"
                 Write-VenDebugLog "\\-- WAF: Serial=$($siteCert.X509.SerialNumber), Thumbprint=$($siteCert.X509.Thumbprint)"
                 Write-VenDebugLog "\\-- Reinstall certificate via API or WebUI to fix this issue"
-            }
-        } # UI/WAF mismatch warning
+            } # UI/WAF mismatch warning
+        }
     }
 
     Write-VenDebugLog "Serial=$($siteSerial), Thumbprint=$($siteThumb)"
@@ -640,10 +602,12 @@ function Get-ImpervaCustomCertificate
 
     $certData = @{
         "site_id"      = $siteId
+        "wafHost"      = $wafHost
         "serialNumber" = $siteSerial
         "fingerprint"  = $siteThumb
         "certExpires"  = $certExpires
         "legacy"       = $siteLegacy
+        "certificate"  = $siteCert
     }
 
     $certData
@@ -666,7 +630,7 @@ function Get-CertFromWaf
     try {
         # open a network connection to the Imperva front-end. Be sure to pass the proper host request header!
         # We're not parsing the webpage so '-UseBasicParsing' helps prevent meaningless IE setup errors messages...
-        Invoke-WebRequest -Uri "$($wafUri)" -Headers @{Host="$($Target)"} -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop | Out-Null
+        Invoke-WebRequest -Uri "$($wafUri)" -Headers @{Host="$($Target)"} -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop | Out-Null
     }
     catch {
         # Log the error but keep on trucking... We only want the TLS handshake anyway.

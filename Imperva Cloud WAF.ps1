@@ -3,7 +3,7 @@
 #
 # CCamacho Template Driver Version: 202006101700
 #
-$Script:AdaptableAppVer = '202212281614'
+$Script:AdaptableAppVer = '202212281709'
 $Script:AdaptableAppDrv = "Imperva Cloud WAF"
 
 # Import Legacy Imperva sites?
@@ -84,7 +84,6 @@ function Install-Certificate
 
     Initialize-VenDebugLog -General $General
 
-#    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls12
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
     $siteId =$General.VarText1
@@ -137,6 +136,9 @@ function Update-Binding
 
 function Activate-Certificate
 {
+    # This line tells VS Code to not flag this function's name as a "problem"
+    [Diagnostics.CodeAnalysis.SuppressMessage('PSUseApprovedVerbs', '', Justification='Forced by Venafi', Scope='function')]
+    
     Param(
         [Parameter(Mandatory=$true,HelpMessage="General Parameters")]
         [System.Collections.Hashtable]$General
@@ -148,6 +150,9 @@ function Activate-Certificate
 # MANDATORY FUNCTION
 function Extract-Certificate
 {
+    # This line tells VS Code to not flag this function's name as a "problem"
+    [Diagnostics.CodeAnalysis.SuppressMessage('PSUseApprovedVerbs', '', Justification='Forced by Venafi', Scope='function')]
+    
     Param(
         [Parameter(Mandatory=$true,HelpMessage="General Parameters")]
         [System.Collections.Hashtable]$General
@@ -186,6 +191,9 @@ function Extract-Certificate
 
 function Extract-PrivateKey
 {
+    # This line tells VS Code to not flag this function's name as a "problem"
+    [Diagnostics.CodeAnalysis.SuppressMessage('PSUseApprovedVerbs', '', Justification='Forced by Venafi', Scope='function')]
+    
     Param(
         [Parameter(Mandatory=$true,HelpMessage="General Parameters")]
         [System.Collections.Hashtable]$General,
@@ -217,6 +225,9 @@ function Remove-Certificate
 #
 function Discover-Certificates
 {
+    # This line tells VS Code to not flag this function's name as a "problem"
+    [Diagnostics.CodeAnalysis.SuppressMessage('PSUseApprovedVerbs', '', Justification='Forced by Venafi', Scope='function')]
+    
     Param(
         [Parameter(Mandatory=$true,HelpMessage="General Parameters")]
         [System.Collections.Hashtable]$General
@@ -226,7 +237,6 @@ function Discover-Certificates
 
     Initialize-VenDebugLog -General $General
 
-#    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls12
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $apiUrl ="https://my.imperva.com/api/prov/v1/sites/list"
 
@@ -402,11 +412,6 @@ function Initialize-VenDebugLog
     Write-VenDebugLog -NoFunctionTag -LogMessage "PowerShell Environment: $($PSVersionTable.PSEdition) Edition, Version $($PSVersionTable.PSVersion.Major)"
 
     Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
-}
-
-function Get-ImpervaCertificate
-{
-
 }
 
 function Invoke-ImpervaRestMethod

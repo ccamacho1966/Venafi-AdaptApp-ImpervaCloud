@@ -3,7 +3,7 @@
 #
 # CCamacho Template Driver Version: 202006101700
 #
-$Script:AdaptableAppVer = '202208081912'
+$Script:AdaptableAppVer = '202212280952'
 $Script:AdaptableAppDrv = "Imperva Cloud WAF"
 
 # Import Legacy Imperva sites?
@@ -433,13 +433,15 @@ function Invoke-ImpervaRestMethod
             throw $_
         }
         # 3015 signifies a temporary error "please try again"
-        if ($response.res -ne 3015) { return $response }
+        # 2022-12-28 retry any non-zero result code due to flakey API
+        if ($response.res -eq 0) { return $response }
         $i++
         $wait = Get-Random -Minimum ($i+1) -Maximum ($i*3)
-        Write-VenDebugLog "Attempt #$($i) soft failure ($($response.debug_info.Error)) - sleeping for $($wait) seconds"
+        Write-VenDebugLog "Attempt #$($i) failed ($($response.debug_info.Error)) - sleeping for $($wait) seconds"
         Start-Sleep -Seconds $wait
     } while ($i -lt $Attempts)
 
+    # if API call keeps failing just return bad results
     $response
 }
 

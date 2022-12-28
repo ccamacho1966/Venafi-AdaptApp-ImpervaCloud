@@ -3,7 +3,7 @@
 #
 # CCamacho Template Driver Version: 202006101700
 #
-$Script:AdaptableAppVer = '202212281509'
+$Script:AdaptableAppVer = '202212281614'
 $Script:AdaptableAppDrv = "Imperva Cloud WAF"
 
 # Import Legacy Imperva sites?
@@ -404,6 +404,11 @@ function Initialize-VenDebugLog
     Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
 }
 
+function Get-ImpervaCertificate
+{
+
+}
+
 function Invoke-ImpervaRestMethod
 {
 	Param(
@@ -489,10 +494,15 @@ function Get-ImpervaCustomCertificate
 
     Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
 
+    $Attempts=3
     $siteId     = $Website.site_id
     $siteName   = $Website.display_name
     $siteLegacy = $false
     $apiUrl     = "https://api.imperva.com/certificates/v3/certificates?extSiteId=$($siteId)&certType=CUSTOM_CERT"
+    $apiAuth = @{
+        'x-API-Id'  = $General.UserName;
+        'x-API-Key' = $General.UserPass
+    }
 
     foreach ($dnsBlock in $Website.dns) {
         if ($dnsBlock.dns_record_name -eq $Website.domain) {
@@ -502,7 +512,19 @@ function Get-ImpervaCustomCertificate
     }
 
     try {
-        $response   = Invoke-ImpervaRestMethod -General $General -Uri $apiUrl -Method Get
+        $i=0
+        do {
+            $response = Invoke-WebRequest -Uri $apiUrl -Method Get -Headers $apiAuth -UseBasicParsing
+            if ($response.StatusCode -eq 200) { break }
+            # did not receive a 200 OK, retry the request after a brief sleep
+            $i++
+            $wait = Get-Random -Minimum ($i+1) -Maximum ($i*3)
+            Write-VenDebugLog "Attempt #$($i) failed ($($response.StatusCode): $($response.statusDescription)) - sleeping for $($wait) seconds"
+            Start-Sleep -Seconds $wait
+        } while ($i -lt $Attempts)
+        if ($response.StatusCode -ne 200) {
+            throw "Failed to retrieve certificate: ($($response.StatusCode): $($response.statusDescription))"
+        }
     }
     catch {
         $fatal = "Failed to retrieve custom certificate data: $($_)"
@@ -510,43 +532,39 @@ function Get-ImpervaCustomCertificate
         throw $fatal
     }
 
+    $responseData = (($response.Content | ConvertFrom-Json).data)
+
     # This should only happen during discovery of an unencrypted site
-    if ($response.data.Count -eq 0) {
+    if ($responseData.Count -eq 0) {
 #        Write-VenDebugLog "No custom certificate found for $($siteName) (site #$($siteId))"
         return $null
     }
     # Getting back more than 1 result should NEVER happen...
-    elseif ($response.data.Count -ne 1) {
-        $fatal = "Custom certificate count is $($response.data.Count)... This should never happen!"
+    elseif ($responseData.Count -ne 1) {
+        $fatal = "Custom certificate count is $($responseData.Count)... This should never happen!"
         Write-VenDebugLog $fatal
         throw $fatal
     }
 
-    if ($response.errors.status) {
-        $fatal = "Imperva API threw an error for $($siteName) (site #$($siteId)): $($response.errors.status) $($response.errors.detail)"
+    if ($responseData.extSiteId -ne $siteId) {
+        $fatal = "Data Mismatch! Asked for $($siteName) (site #$($siteId)) but got results for site #$($responseData.extSiteId)..."
         Write-VenDebugLog $fatal
         throw $fatal
     }
 
-    if ($response.data.extSiteId -ne $siteId) {
-        $fatal = "Data Mismatch! Asked for $($siteName) (site #$($siteId)) but got results for site #$($response.data.extSiteId)..."
-        Write-VenDebugLog $fatal
-        throw $fatal
-    }
-
-    $siteSerial  = $apiSerial = ($response.data.customCertificateDetails.serialNumber -replace ':','')
-    $siteThumb   = $apiThumb  = ($response.data.customCertificateDetails.fingerprint -replace 'SHA1 Fingerprint=','' -replace ':','')
-    $certExpires = Convert-ImpervaTimestamp "$($response.data.expirationDate)"
+    $siteSerial  = $apiSerial = ($responseData.customCertificateDetails.serialNumber -replace ':','')
+    $siteThumb   = $apiThumb  = ($responseData.customCertificateDetails.fingerprint -replace 'SHA1 Fingerprint=','' -replace ':','')
+    $certExpires = Convert-ImpervaTimestamp "$($responseData.expirationDate)"
 
     # Imperva will only return data for valid/active certificates... plus the front-end won't work right!
     # This is an attempt to handle the unexpected results for expired/inactive certificates
     $GoodImpervaStatus = @('ACTIVE','NEAR_EXPIRATION')
-    if ($response.data.status -eq 'EXPIRED') {
+    if ($responseData.status -eq 'EXPIRED') {
         Write-VenDebugLog "EXPIRED: Certificate for $($siteName) (site #$($siteId)) expired on $($certExpires)"
         return $null
     }
-    elseif ($response.data.status -notin $GoodImpervaStatus) {
-        Write-VenDebugLog "ERROR: Unexpected certificate status '$($response.data.status)' for $($siteName) (site #$($siteId))"
+    elseif ($responseData.status -notin $GoodImpervaStatus) {
+        Write-VenDebugLog "ERROR: Unexpected certificate status '$($responseData.status)' for $($siteName) (site #$($siteId))"
         return $null
     }
 
@@ -566,7 +584,7 @@ function Get-ImpervaCustomCertificate
         throw("Fingerprint not available from Imperva Cloud WAF");
     }
 
-    if ($null -eq $response.data.expirationDate) {
+    if ($null -eq $responseData.expirationDate) {
         Write-VenDebugLog "No expiration date retrieved from Imperva Cloud WAF for $($siteName) (site #$($siteId))"
         throw("Expiration date not available from Imperva Cloud WAF");
     }
@@ -595,7 +613,7 @@ function Get-ImpervaCustomCertificate
 
     Write-VenDebugLog "Serial=$($siteSerial), Thumbprint=$($siteThumb)"
 
-    if ($response.data.customCertificateDetails.hasMismatchSite -eq $true) {
+    if ($responseData.customCertificateDetails.hasMismatchSite -eq $true) {
         Write-VenDebugLog 'WARNING: Imperva reports a "site mismatch" error... The certificate does not match the site name!'
     }
 

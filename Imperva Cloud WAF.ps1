@@ -3,7 +3,7 @@
 #
 # CCamacho Template Driver Version: 202006101700
 #
-$Script:AdaptableAppVer = '202212280952'
+$Script:AdaptableAppVer = '202212281025'
 $Script:AdaptableAppDrv = "Imperva Cloud WAF"
 
 # Import Legacy Imperva sites?
@@ -36,18 +36,9 @@ Passwd|Password Field|000
 
 #>
 
-#
-# REQUIRED FUNCTIONS
-#
-# Extract-Certificate >>> must always be implemented. it is required for validation.
-#
-# Install-Certificate >>> generally required to be implemented. You can optionally
-# return "NotUsed" for this function *ONLY* if you instead implement Install-PrivateKey
-# for your driver. In most cases, you will need Install-Certificate only. The function
-# Install-Chain is also available if you need to implement certificate installation
-# using 3 different functions for the public, private, and chain certificates.
-#
-
+# Stage 800: OPTIONAL FUNCTION
+# Provision each of the certificates in the CA trust chain
+# This function supports the "ResumeLater" result code
 function Install-Chain
 {
     Param(
@@ -60,6 +51,9 @@ function Install-Chain
     return @{ Result="NotUsed"; }
 }
 
+# Stage 801: OPTIONAL FUNCTION (unless Install-Certificate has not been implemented)
+# Provision the private key associated with the certificate
+# This function supports the "ResumeLater" result code
 function Install-PrivateKey
 {
     Param(
@@ -72,7 +66,9 @@ function Install-PrivateKey
     return @{ Result="NotUsed"; }
 }
 
-# MANDATORY FUNCTION
+# Stage 802: MANDATORY FUNCTION (unless Install-PrivateKey has been implemented)
+# Provision the certificate. Can also provision the chain and private key.
+# This function supports the "ResumeLater" result code
 function Install-Certificate
 {
     Param(
@@ -125,6 +121,9 @@ function Install-Certificate
     return @{ Result="Success"; }
 }
 
+# Stage 803: OPTIONAL FUNCTION
+# Associate the provisioned certificate and private key to the application
+# This function supports the "ResumeLater" result code
 function Update-Binding
 {
     Param(
@@ -135,8 +134,14 @@ function Update-Binding
     return @{ Result="NotUsed"; }
 }
 
+# Stage 804: OPTIONAL FUNCTION
+# Activate/Commit the updated certificate and private key for the application
+# This function supports the "ResumeLater" result code
 function Activate-Certificate
 {
+    # This line tells VS Code to not flag this function's name as a "problem"
+    [Diagnostics.CodeAnalysis.SuppressMessage("PSUseApprovedVerbs", Scope="function")]
+    
     Param(
         [Parameter(Mandatory=$true,HelpMessage="General Parameters")]
         [System.Collections.Hashtable]$General
@@ -145,9 +150,17 @@ function Activate-Certificate
     return @{ Result="NotUsed"; }
 }
 
-# MANDATORY FUNCTION
+# VALIDATION: MANDATORY FUNCTION
+# Extract public certificate information used for validation and possibly update the database
+# Option 1: Extract and return the public certificate (and optionally the certificate chain)
+# -- Option 1 can update the certificate in the TPP database
+# Option 2: Return only the certificate thumbprint and serial number to match against the existing inventory
+# -- Option 2 can only be used to validate the installation - it cannot update the database
 function Extract-Certificate
 {
+    # This line tells VS Code to not flag this function's name as a "problem"
+    [Diagnostics.CodeAnalysis.SuppressMessage("PSUseApprovedVerbs", Scope="function")]
+    
     Param(
         [Parameter(Mandatory=$true,HelpMessage="General Parameters")]
         [System.Collections.Hashtable]$General
@@ -184,8 +197,13 @@ function Extract-Certificate
     return @{ Result="Success"; Serial=$($customCert.serialNumber); Thumbprint=$($customCert.fingerprint) }
 }
 
+# VALIDATION: OPTIONAL FUNCTION
+# Extract the certificate's private key
 function Extract-PrivateKey
 {
+    # This line tells VS Code to not flag this function's name as a "problem"
+    [Diagnostics.CodeAnalysis.SuppressMessage("PSUseApprovedVerbs", Scope="function")]
+    
     Param(
         [Parameter(Mandatory=$true,HelpMessage="General Parameters")]
         [System.Collections.Hashtable]$General,
@@ -217,6 +235,9 @@ function Remove-Certificate
 #
 function Discover-Certificates
 {
+    # This line tells VS Code to not flag this function's name as a "problem"
+    [Diagnostics.CodeAnalysis.SuppressMessage("PSUseApprovedVerbs", Scope="function")]
+    
     Param(
         [Parameter(Mandatory=$true,HelpMessage="General Parameters")]
         [System.Collections.Hashtable]$General
@@ -226,7 +247,6 @@ function Discover-Certificates
 
     Initialize-VenDebugLog -General $General
 
-#    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls12
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $apiUrl ="https://my.imperva.com/api/prov/v1/sites/list"
 

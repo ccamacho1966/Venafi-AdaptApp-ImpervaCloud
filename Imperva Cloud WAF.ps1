@@ -3,7 +3,7 @@
 #
 # CCamacho Template Driver Version: 202212281725
 #
-$Script:AdaptableAppVer = '202212281727'
+$Script:AdaptableAppVer = '202303291326'
 $Script:AdaptableAppDrv = "Imperva Cloud WAF"
 
 # Import Legacy Imperva sites?
@@ -172,6 +172,10 @@ function Extract-Certificate
     $siteId=$General.VarText1
     Write-VenDebugLog "Imperva Site #$($siteId)"
 
+    if ($General.HostAddress -ne '') {
+        $wafAccount=$General.HostAddress
+    }
+
     $apiUrl="https://my.imperva.com/api/prov/v1/sites/status"
     $apiBody="site_id=$($siteId)"
 
@@ -187,6 +191,14 @@ function Extract-Certificate
         $apiError=Get-ImpervaErrorMessage -Code $siteInfo.res
         Write-VenDebugLog "API error: $($apiError)"
         throw $apiError
+    }
+
+    if ($wafAccount) {
+        if ($wafAccount -ne $siteInfo.account_id) {
+            $apiError = "Account Mismatch: Site #$($siteId) expected to be in Account #$($wafAccount), but found in Account #$($siteInfo.account_id) instead."
+            Write-VenDebugLog $apiError
+            throw $apiError
+        }
     }
 
     $customCert = Get-ImpervaCustomCertificate -General $General -Website $siteInfo

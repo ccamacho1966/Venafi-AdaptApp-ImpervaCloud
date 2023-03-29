@@ -25,6 +25,8 @@ At this level, setting 'Debug Imperva Cloud WAF Driver' and 'Enable Debug Loggin
 ### Device Option 2: API ID based restrictions
 Create a placeholder device named, for example, 'Imperva Cloud WAF'. Leave the hostname blank. Attach the appropriately scoped API credential to the device as the 'Device Credential' and then run a discovery job against this device. All sites visible to this API ID will be discovered and created as applications underneath the placeholder object.
 
+In this configuration model, all sites visible to the API credential will be placed under the placeholder device. Sub-accounts are effectively ignored.
+
 ### Device Option 3: Sub-Account based devices
 Create a placeholder device named, for example, 'Imperva: Frisbee Division', and set the 'Hostname/Address' to the sub-account ID to link to this device such as '12345678'. Attach an API credential that can manipulate at least this sub-account to the device as the 'Device Credential' and then run a discovery job against this device. All sites in this sub-account will be discovered and created as applications underneath the placeholder object. Sites not linked to this sub-account will be ignored by discovery.
 

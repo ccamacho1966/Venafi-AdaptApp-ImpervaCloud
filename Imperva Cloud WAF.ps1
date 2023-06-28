@@ -3,7 +3,7 @@
 #
 # CCamacho Template Driver Version: 202212281725
 #
-$Script:AdaptableAppVer = '202303291326'
+$Script:AdaptableAppVer = '202306281633'
 $Script:AdaptableAppDrv = "Imperva Cloud WAF"
 
 # Import Legacy Imperva sites?
@@ -587,16 +587,26 @@ function Get-ImpervaCustomCertificate
     $GoodImpervaStatus = @('ACTIVE','NEAR_EXPIRATION')
     if ($responseData.status -eq 'EXPIRED') {
         Write-VenDebugLog "EXPIRED: Certificate for $($siteName) (site #$($siteId)) expired on $($certExpires)"
-        return $null
+        return
     }
     elseif ($responseData.status -notin $GoodImpervaStatus) {
         Write-VenDebugLog "ERROR: Unexpected certificate status '$($responseData.status)' for $($siteName) (site #$($siteId))"
-        return $null
+        return
     }
 
     # Always attempt to pull the public certificate from the WAF front-end
     # This is as much to generate warnings for API bugs as it is to support discovery
     $siteCert = Get-CertFromWaf -WafHost $wafHost -Target $Website.domain
+
+    if (-not $siteCert) {
+        # Pull from front-end failed... Search Venafi for a match.
+        if (-not $siteSerial) {
+            # Give up... no serial from API, no cert from front-end
+            Write-VenDebugLog "Legacy certificate (no serial from API) and front-end unresponsive ... ABORT"
+            return
+        }
+        $siteCert = Find-CertInVenafi -General $General -SerialNumber $siteSerial -Thumbprint $siteThumb
+    }
 
     if (($null -eq $siteSerial) -or ($siteSerial -eq '')) {
         $siteLegacy = $true
@@ -684,8 +694,89 @@ function Get-CertFromWaf
 
     # find the open network connection then import the raw certificate data 
     $sp = [System.Net.ServicePointManager]::FindServicePoint("$($wafUri)")
+
+    # failure was so complete that no certificate was returned by the front-end!!
+    if (-not $sp.Certificate) {
+        Write-VenDebugLog "FAILED to pull certificate for $($Target) from $($WafHost)"
+        return
+    }
+
     $wafCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2
     $wafCert.Import($sp.Certificate.GetRawCertData())
+
+    # create a base-64 formatted string from the certificate (aka PEM data format)
+    $pemData = [Convert]::ToBase64String($wafCert.GetRawCertData(),'InsertLineBreaks')
+    $FormattedPEM = "-----BEGIN CERTIFICATE-----`n$($pemData)`n-----END CERTIFICATE-----"
+
+    # build an object that contains both the certificate object and PEM string data
+    $results = @{
+        X509   = $wafCert
+        PEM    = $FormattedPem
+    }
+
+    $results
+}
+
+function Find-CertInVenafi
+{
+    Param(
+        [Parameter(Mandatory)]
+        [System.Collections.Hashtable] $General,
+
+        [Parameter(Mandatory)]
+        [string]$SerialNumber,
+
+        [Parameter(Mandatory)]
+        [string]$Thumbprint
+    )
+
+    # Create Venafi credential object
+    $vUser = $General.AuxUser
+    $vPass = ConvertTo-SecureString $General.AuxPass -AsPlainText -Force
+    $vCred = New-Object System.Management.Automation.PSCredential($vUser, $vPass)
+
+    # Venafi API hostname defaults to the FQDN of the localhost
+    $apiHost = $env:COMPUTERNAME
+
+    # Try to get the FQDN from an A/AAAA (or CNAME)
+    $lookup = $apiHost | Resolve-DnsName -Type A_AAAA
+    if ($lookup.Count) {
+        # valid record, use the first FQDN returned
+        $vApi = $lookup[0].Name
+    } else {
+        # name couldn't be resolved...
+        Write-VenDebugLog "Couldn't resolve API hostname $($env:COMPUTERNAME)"
+        return
+    }
+    $vParms = @{
+        Server = $vApi
+        Credential = $vCred
+        ClientId = 'imperva'
+        Scope = @{ certificate='manage'; configuration='manage'; restricted='manage' }
+    }
+    $vSession = New-VenafiSession @vParms -PassThru
+    Write-VenDebugLog "Searching the vault for SN: $($SerialNumber)"
+    try {
+        $VaultID = Find-TppVaultId -Attribute @{'Serial'=$SerialNumber} -VenafiSession $vSession
+    } catch {
+        Write-VenDebugLog "Vault ID Failure: $($_)"
+    }
+
+    if (-not $VaultID) {
+        Write-VenDebugLog "Could not find certificate in Venafi vault"
+        Revoke-TppToken -VenafiSession $vSession -Force
+        return
+    }
+
+    Write-VenDebugLog "Retrieving Certificate from the Venafi vault (ID $($VaultID))"
+    [byte[]]$rawCert = Invoke-VenafiRestMethod -Method Get -UriLeaf "Certificates/Retrieve/$($VaultID)?Format=Base64" -VenafiSession $vSession
+    Revoke-TppToken -VenafiSession $vSession -Force
+    $wafCert = [System.Security.Cryptography.X509Certificates.X509Certificate2]($rawCert)
+
+    if ($wafCert.Thumbprint -ne $Thumbprint) {
+        Write-VenDebugLog "Vault ID #$($VaultID) - Thumbprint mismatch (Looking for $($Thumbprint) but found $($wafCert.Thumbprint))"
+        return
+    }
 
     # create a base-64 formatted string from the certificate (aka PEM data format)
     $pemData = [Convert]::ToBase64String($wafCert.GetRawCertData(),'InsertLineBreaks')

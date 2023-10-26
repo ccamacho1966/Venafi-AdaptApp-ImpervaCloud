@@ -580,7 +580,6 @@ function Get-ImpervaCustomCertificate
 
     # This should only happen during discovery of an unencrypted site
     if ($responseData.Count -eq 0) {
-#        Write-VenDebugLog "No custom certificate found for $($siteName) (site #$($siteId))"
         return $null
     }
     # Getting back more than 1 result should NEVER happen...
@@ -704,8 +703,7 @@ function Get-CertFromWaf
         # open a network connection to the Imperva front-end. Be sure to pass the proper host request header!
         # We're not parsing the webpage so '-UseBasicParsing' helps prevent meaningless IE setup errors messages...
         Invoke-WebRequest -Uri "$($wafUri)" -Headers @{Host="$($Target)"} -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop | Out-Null
-    }
-    catch {
+    } catch {
         # Log the error but keep on trucking... We only want the TLS handshake anyway.
         Write-VenDebugLog "Ignoring Error: $($_)"
     }

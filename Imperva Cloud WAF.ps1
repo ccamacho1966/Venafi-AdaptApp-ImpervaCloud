@@ -3,7 +3,7 @@
 #
 # CCamacho Template Driver Version: 202212281725
 #
-$Script:AdaptableAppVer = '202402191048'
+$Script:AdaptableAppVer = '202402191105'
 $Script:AdaptableAppDrv = 'Imperva Cloud WAF'
 
 # Global driver configurations that can't be setup any other way
@@ -391,7 +391,7 @@ function Discover-Certificates
 function Write-VenDebugLog
 {
     Param(
-        [Parameter(Position=0, Mandatory)]
+        [Parameter(Position=0, ValueFromPipeline, Mandatory)]
         [string] $LogMessage,
 
         [Parameter()]

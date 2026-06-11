@@ -3,7 +3,7 @@
 #
 # CCamacho Template Driver Version: 202212281725
 #
-$Script:AdaptableAppVer = '202408131645'
+$Script:AdaptableAppVer = '202408271549'
 $Script:AdaptableAppDrv = 'Imperva Cloud WAF'
 
 # Global driver configurations that can't be setup any other way
@@ -126,9 +126,7 @@ function Install-Certificate
     try {
         $siteInfo = Invoke-ImpervaRestMethod -General $General -Method Put -Uri $apiUrl -Body ($apiBody|ConvertTo-Json -Depth 9)
     } catch {
-        Write-VenDebugLog "Install Failure: $($_)"
-        Write-VenDebugLog "$($_|ConvertTo-Json -Depth 9 -Compress)"
-        throw("Install Failure: $($_)")
+        Write-VenDebugLog "Install Failure: $($_)" -ThrowException
     }
 
     if ($siteInfo.res -ne 0) {
@@ -420,17 +418,17 @@ function Write-VenDebugLog
 
     filter Add-TS {"$(Get-Date -Format o): $_"}
 
-    # if the logfile isn't initialized then do nothing and return immediately
-    if ($null -eq $Script:venDebugFile) { return }
+    # only write the log message to a file if the logfile is set...
+    if ($Script:venDebugFile) {
+        if ($NoFunctionTag.IsPresent) {
+            $taggedLog = $LogMessage
+        } else {
+            $taggedLog = "[$((Get-PSCallStack)[1].Command)] $($LogMessage)"
+        }
 
-    if ($NoFunctionTag.IsPresent) {
-        $taggedLog = $LogMessage
-    } else {
-        $taggedLog = "[$((Get-PSCallStack)[1].Command)] $($LogMessage)"
+        # write the message to the debug file
+        Write-Output "$($taggedLog)" | Add-TS | Add-Content -Path $Script:venDebugFile
     }
-
-    # write the message to the debug file
-    Write-Output "$($taggedLog)" | Add-TS | Add-Content -Path $Script:venDebugFile
 
     # throw the message as an exception, if requested
     if ($ThrowException.IsPresent) {
@@ -509,7 +507,10 @@ function Invoke-ImpervaRestMethod
         Headers     = $apiAuth
         ContentType = $ContentType
     }
-    if ($Body)       { $ImpervaRestApiCall.Body       = $Body       }
+    if ($Body)       {
+        $ImpervaRestApiCall.Body = $Body
+        Write-VenDebugLog "API Call Body:`n$($Body)"
+    }
     if ($TimeoutSec) { $ImpervaRestApiCall.TimeoutSec = $TimeoutSec }
 
     $Attempts=3
@@ -518,8 +519,13 @@ function Invoke-ImpervaRestMethod
         try {
             $response = Invoke-RestMethod @ImpervaRestApiCall
         } catch {
-            Write-VenDebugLog "REST call failed to '$($Uri)': $($_)"
-            throw $_
+            $ErrorResults = "$($_)" | ConvertFrom-Json
+            if ($null -ne $ErrorResults.res) {
+                Write-VenDebugLog "Error #$($ErrorResults.res): returning results to driver..."
+                $response = $ErrorResults
+            } else {
+                "REST call failed: $($_)" | Write-VenDebugLog -ThrowException
+            }
         }
 
         # return response upon success, otherwise retry
@@ -547,7 +553,7 @@ function Invoke-ImpervaRestMethod
         } else {
             $error_message = $response.debug_info.problem
         }
-        Write-VenDebugLog "Attempt #$($i) failed ($($error_message)) - sleeping for $($wait) seconds"
+        Write-VenDebugLog "Attempt #$($i) failed (Error #$($response.res): $($error_message)) - sleeping for $($wait) seconds"
         Start-Sleep -Seconds $wait
     } while ($i -lt $Attempts)
 

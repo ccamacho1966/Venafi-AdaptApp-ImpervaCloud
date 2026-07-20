@@ -3,24 +3,8 @@
 #
 # CCamacho Template Driver Version: 202212281725
 #
-$Script:AdaptableAppVer = '202408271549'
+$Script:AdaptableAppVer = '202607201742'
 $Script:AdaptableAppDrv = 'Imperva Cloud WAF'
-
-# Global driver configurations that can't be setup any other way
-
-# These can enable/disable functionality for the discovery driver
-#
-# SubAccounts: Scan for new subaccounts and add them to the policy tree?
-# AddPolicies: Place new subaccount devices in a new policy folder?
-
-$Script:DiscoveryOptions = @{
-    SubAccounts = $true
-    AddPolicies = $true
-}
-
-# If the website has been moved between subaccounts on Imperva then attempt to just
-# move the application to the correct device rather than throwing a validation error
-$Script:MoveWebSites = $true
 
 <#
 
@@ -37,13 +21,59 @@ Text1|Imperva Site ID|101
 Text2|Text Label #2|000
 Text3|Text Label #3|000
 Text4|Text Label #4|000
-Text5|Text Label #5|000
+Text5|Imperva Cloud WAF Options (APIBody DumpGeneral DumpSpecific UnmaskFields WAFBadRC WAFErrors)|110
 Option1|Debug Imperva Cloud WAF Driver|110
 Option2|Yes/No #2|000
 Passwd|Password Field|000
 -----END FIELD DEFINITIONS-----
 
 #>
+
+# Global driver configurations that can't be setup any other way
+
+# These can enable/disable functionality for the discovery driver
+#
+# SubAccounts: Scan for new subaccounts and add them to the policy tree?
+# AddPolicies: Place new subaccount devices in a new policy folder?
+
+$Script:DiscoveryOptions = @{
+    SubAccounts = $true
+    AddPolicies = $true
+}
+
+# These options can be modified by passing in text strings (Text5)
+#
+# APIBody:      Output the masked body of API calls to the debug logs
+# DumpGeneral:  Output the masked General hashtable to the debug logs
+# DumpSpecific: Output the unredacted Specific hashtable to the debug logs
+# RedactData:   This will mask selected fields in the debug output by default
+#               'UnmaskFields' will set this to false and dump sensitive data
+# WAFErrors:    Log non-fatal WAF errors when retrieving certificates from
+#               the WAF front-end (API Errors are always logged)
+
+$Script:DebugOptions = @{
+    APIBody      = $false
+    WAFBadRC     = $false
+    DumpGeneral  = $false
+    DumpSpecific = $false
+    RedactData   = $true
+    WAFErrors    = $false
+}
+
+$Script:SensitiveFields = (
+    'Password',
+    'UserPass',
+    'AuxPass',
+    'VarPass',
+    'UserPrivKey',
+    'PassPhrase',
+    'Private_Key',
+    'Certificate'
+)
+
+# If the website has been moved between subaccounts on Imperva then attempt to just
+# move the application to the correct device rather than throwing a validation error
+$Script:MoveWebSites = $true    # not currently implemented
 
 # Stage 800: OPTIONAL FUNCTION
 # Provision each of the certificates in the CA trust chain
@@ -87,7 +117,7 @@ function Install-Certificate
         [System.Collections.Hashtable]$Specific
     )
 
-    Initialize-VenDebugLog -General $General
+    Initialize-VenDebugLog -General $General -Specific $Specific
 
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
@@ -108,13 +138,12 @@ function Install-Certificate
     Add-Type -AssemblyName System.Security
     $X509Certificate  = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new([Convert]::FromBase64String($certB64))
     $AuthTypeFullName = $X509Certificate.SignatureAlgorithm.FriendlyName
-    Write-VenDebugLog "Certificate Signature Algorithm is $($AuthTypeFullName) ($($X509Certificate.SignatureAlgorithm.Value))"
     if ($AuthTypeFullName -like '*RSA*') {
         $X509AuthType = 'RSA'
     } else {
         $X509AuthType = 'ECC'
     }
-    Write-VenDebugLog "Setting Imperva custom certificate auth-type to '$($X509AuthType)'"
+    Write-VenDebugLog "Setting certificate auth-type to '$($X509AuthType)' ($($AuthTypeFullName) $($X509Certificate.SignatureAlgorithm.Value))"
 
     $apiBody = @{
         'certificate' = $certB64
@@ -124,13 +153,16 @@ function Install-Certificate
     }
 
     try {
-        $siteInfo = Invoke-ImpervaRestMethod -General $General -Method Put -Uri $apiUrl -Body ($apiBody|ConvertTo-Json -Depth 9)
+        $siteInfo = Invoke-ImpervaRestMethod -General $General -Method Put -Uri $apiUrl -Body $apiBody
     } catch {
         Write-VenDebugLog "Install Failure: $($_)" -ThrowException
     }
 
     if ($siteInfo.res -ne 0) {
         $apiError = "API error $($siteInfo.res): $($siteInfo.res_message)"
+        if ($siteInfo.debug_info.certificate) {
+            $apiError += " ($($siteInfo.debug_info.certificate))"
+        }
         Write-VenDebugLog $apiError
         Write-VenDebugLog "$($siteInfo|ConvertTo-Json -Depth 9 -Compress)"
         if ($siteInfo.res -eq 3015) {
@@ -290,8 +322,6 @@ function Discover-Certificates
         Uri     = 'https://my.imperva.com/api/prov/v1/sites/list'
     }
 
-#    Write-VenDebugLog "General: $($General | ConvertTo-Json | Out-String)"
-
     if (($General.HostAddress -eq '') -or ($General.HostAddress -eq '*')) {
         $wafAccount = '*'
         $wafSearch  = ''
@@ -439,7 +469,11 @@ function Write-VenDebugLog
 function Initialize-VenDebugLog
 {
     Param(
-        [Parameter(Position=0, Mandatory)][System.Collections.Hashtable]$General
+        [Parameter(Position=0, Mandatory)]
+        [System.Collections.Hashtable]$General,
+
+        [Parameter(Position=1)]
+        [System.Collections.Hashtable]$Specific = $null
     )
 
     # if the debugfile is already setup we shouldn't be called again - log a warning
@@ -455,8 +489,7 @@ function Initialize-VenDebugLog
 
         # pull Venafi base directory from registry for global debug flag
         $logPath = "$((Get-ItemProperty HKLM:\Software\Venafi\Platform).'Base Path')Logs"
-    }
-    else {
+    } else {
         # use the path but discard the filename from the DEBUG_FILE variable
         $logPath = "$(Split-Path -Path $DEBUG_FILE)"
     }
@@ -474,6 +507,81 @@ function Initialize-VenDebugLog
     Write-VenDebugLog -NoFunctionTag -LogMessage "PowerShell Environment: $($PSVersionTable.PSEdition) Edition, Version $($PSVersionTable.PSVersion.Major)"
 
     Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
+
+    # Process advanced debug options
+    if ($General.VarText5) {
+        $AdvDebugOptions = $General.VarText5.Trim() -split "[ ,|]" | Where-Object -FilterScript { $_ }
+        if ($AdvDebugOptions -contains 'UnmaskFields') {
+            Write-VenDebugLog "Advanced Debug: Sensitive fields will not be redacted (UnmaskFields)"
+            $Script:DebugOptions.RedactData = $false
+        }
+        if ($AdvDebugOptions -contains 'APIBody') {
+            Write-VenDebugLog "Advanced Debug: API body will be output to the debug logs"
+            $Script:DebugOptions.APIBody = $true
+        }
+        if ($AdvDebugOptions -contains 'WAFErrors') {
+            Write-VenDebugLog "Advanced Debug: Non-fatal WAF errors will be output to the debug logs"
+            $script:DebugPreference.WAFErrors = $true
+        }
+        if ($AdvDebugOptions -contains 'DumpGeneral') {
+            Write-VenDebugLog "Advanced Debug: Including dump of variables from the GENERAL hashtable"
+            $RedactedData = $General|Remove-RedactedValues
+            foreach ($key in ($RedactedData.Keys|Sort-Object)) {
+                Add-Content -Path $Script:venDebugFile ">>>>> $($key): $($RedactedData[$key])"
+            }
+        }
+        if ($AdvDebugOptions -contains 'DumpSpecific') {
+            if ($Specific) {
+                Write-VenDebugLog "Advanced Debug: Including dump of variables from the SPECIFIC hashtable"
+                # Specific hashtable is never redacted - nothing would be left to log!
+                $RedactedData = $Specific
+                foreach ($key in ($RedactedData.Keys|Sort-Object)) {
+                    Add-Content -Path $Script:venDebugFile ">>>>> $($key): $($RedactedData[$key])"
+                }
+            }
+        }
+    }
+}
+
+function Remove-RedactedValues
+{
+    Param(
+        [Parameter(Mandatory,ValueFromPipeline,Position=0)]
+        [System.Collections.Hashtable] $InputObject
+    )
+
+    # Return the original object if sensitive data is not being redacted
+    if (-not $Script:DebugOptions.RedactData) {
+        Write-VenDebugLog 'Sensitive fields have been unmasked - Doing nothing'
+        return $InputObject
+    }
+
+    # Return the original object if object is not a hashtable
+    if ($InputObject.GetType().Name -ne 'Hashtable') {
+        Write-VenDebugLog "not a hashtable (type: $($InputObject.GetType().Name))"
+        return $InputObject
+    }
+
+    # Create a shallow copy of the input object
+    $RedactedData = $InputObject.Clone()
+
+    # Mask sensitive values in the COPY of the input object
+    $i=0
+    foreach ($key in $InputObject.keys) {
+        if ($key -in $Script:SensitiveFields) {
+            if ($InputObject[$key]) {
+                $i++
+                $RedactedData[$key] = '<<<REDACTED>>>'
+            }
+        }
+    }
+    if ($i) {
+        if ($i -gt 1) { $s = 's' } else { $s = '' }
+        Write-VenDebugLog "Redacted $($i) field$($s)"
+    }
+
+    # Return the redacted copy of the original object
+    $RedactedData
 }
 
 function Invoke-ImpervaRestMethod
@@ -507,9 +615,24 @@ function Invoke-ImpervaRestMethod
         Headers     = $apiAuth
         ContentType = $ContentType
     }
+
+    # Convert body hashtable to JSON and optionally log the possibly redacted result
     if ($Body)       {
-        $ImpervaRestApiCall.Body = $Body
-        Write-VenDebugLog "API Call Body:`n$($Body)"
+        if ($Body.GetType().Name -eq 'Hashtable') {
+            # Convert the hashtable to JSON
+            $ImpervaRestApiCall.ContentType = 'application/json'
+            $ImpervaRestApiCall.Body        = ($Body|ConvertTo-Json -Depth 9)
+            if ($Script:DebugOptions.APIBody) {
+                # Log the possibly redacted body json
+                Write-VenDebugLog "API Call Body:`n$($Body|Remove-RedactedValues|ConvertTo-Json -Depth 9)"
+            }
+        } else {
+            $ImpervaRestApiCall.Body        = $Body
+            if ($Script:DebugOptions.APIBody) {
+                # Log the raw body string (cannot be redacted)
+                Write-VenDebugLog "API Call Body: $($Body)"
+            }
+        }
     }
     if ($TimeoutSec) { $ImpervaRestApiCall.TimeoutSec = $TimeoutSec }
 
@@ -521,7 +644,16 @@ function Invoke-ImpervaRestMethod
         } catch {
             $ErrorResults = "$($_)" | ConvertFrom-Json
             if ($null -ne $ErrorResults.res) {
-                Write-VenDebugLog "Error #$($ErrorResults.res): returning results to driver..."
+                $apiError = "API error $($ErrorResults.res): $($ErrorResults.res_message)"
+                if ($ErrorResults.debug_info.Error) {
+                    $apiError += " ($($ErrorResults.debug_info.Error))"
+                } elseif ($ErrorResults.debug_info.problem) {
+                    $apiError += " ($($ErrorResults.debug_info.problem))"
+                } elseif ($ErrorResults.debug_info.certificate) {
+                    $apiError += " ($($ErrorResults.debug_info.certificate))"
+                }
+                Write-VenDebugLog "Attempt #$($i): $($apiError)"
+                Write-VenDebugLog "DEBUG INFO: $($ErrorResults|ConvertTo-Json -Depth 9 -Compress)"
                 $response = $ErrorResults
             } else {
                 "REST call failed: $($_)" | Write-VenDebugLog -ThrowException
@@ -530,6 +662,11 @@ function Invoke-ImpervaRestMethod
 
         # return response upon success, otherwise retry
         if ($response.res -eq 0) { return $response }
+
+        # log the entire response if not a success and 'WAFBadRC' option is set
+        if ($Script:DebugOptions.WAFBadRC) {
+            Write-VenDebugLog "RC<>0: $($response|ConvertTo-Json -Depth 9 -Compress)"
+        }
 
         # error 9415 is "Operation not allowed" - return immediately
         if ($response.res -eq 9415) { return $response }
@@ -548,16 +685,12 @@ function Invoke-ImpervaRestMethod
 
         $i++
         $wait = Get-Random -Minimum ($i+1) -Maximum ($i*3)
-        if ($response.debug_info.Error) {
-            $error_message = $response.debug_info.Error
-        } else {
-            $error_message = $response.debug_info.problem
-        }
-        Write-VenDebugLog "Attempt #$($i) failed (Error #$($response.res): $($error_message)) - sleeping for $($wait) seconds"
+        Write-VenDebugLog "Attempt #$($i) failed - sleeping for $($wait) seconds"
         Start-Sleep -Seconds $wait
     } while ($i -lt $Attempts)
 
     # if API call keeps failing just return bad results
+    Write-VenDebugLog "$($i) API call failures - returning results to driver..."
     $response
 }
 
@@ -612,8 +745,7 @@ function Get-ImpervaCustomCertificate
         if ($response.StatusCode -ne 200) {
             throw "Failed to retrieve certificate: ($($response.StatusCode): $($response.statusDescription))"
         }
-    }
-    catch {
+    } catch {
         $fatal = "Failed to retrieve custom certificate data: $($_)"
         Write-VenDebugLog $fatal
         throw $fatal
@@ -648,8 +780,7 @@ function Get-ImpervaCustomCertificate
     if ($responseData.status -eq 'EXPIRED') {
         Write-VenDebugLog "EXPIRED: Certificate for $($siteName) (site #$($siteId)) expired on $($certExpires)"
         return
-    }
-    elseif ($responseData.status -notin $GoodImpervaStatus) {
+    } elseif ($responseData.status -notin $GoodImpervaStatus) {
         Write-VenDebugLog "ERROR: Unexpected certificate status '$($responseData.status)' for $($siteName) (site #$($siteId))"
         return
     }
@@ -686,7 +817,8 @@ function Get-ImpervaCustomCertificate
     }
 
     if ($null -ne $siteCert) {
-        Write-VenDebugLog "Certificate '$($siteCert.X509.GetNameInfo(0,$false))' issued by '$($siteCert.X509.GetNameInfo(0,$true))'"
+        Write-VenDebugLog "'$($siteCert.X509.GetNameInfo(0,$false))' issued by '$($siteCert.X509.GetNameInfo(0,$true))' expires $($certExpires)"
+        Write-VenDebugLog "Serial=$($siteSerial), Thumbprint=$($siteThumb)"
         if (!$siteLegacy) {
             if (($siteCert.X509.SerialNumber.TrimStart('0') -ne $apiSerial.TrimStart('0')) -or ($siteCert.X509.Thumbprint.TrimStart('0') -ne $apiThumb.TrimStart('0'))) {
                 # This is a pretty annoying bug...
@@ -707,13 +839,9 @@ function Get-ImpervaCustomCertificate
         }
     }
 
-    Write-VenDebugLog "Serial=$($siteSerial), Thumbprint=$($siteThumb)"
-
     if ($responseData.customCertificateDetails.hasMismatchSite -eq $true) {
         Write-VenDebugLog 'WARNING: Imperva reports a "site mismatch" error... The certificate does not match the site name!'
     }
-
-    Write-VenDebugLog "Certificate Valid Until $($certExpires)"
 
     $certData = @{
         "site_id"      = $siteId
@@ -747,8 +875,10 @@ function Get-CertFromWaf
         # We're not parsing the webpage so '-UseBasicParsing' helps prevent meaningless IE setup errors messages...
         Invoke-WebRequest -Uri "$($wafUri)" -Headers @{Host="$($Target)"} -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop | Out-Null
     } catch {
-        # Log the error but keep on trucking... We only want the TLS handshake anyway.
-        Write-VenDebugLog "Ignoring Error: $($_)"
+        if ($Script:DebugOptions.WAFErrors) {
+            # Log the error but keep on trucking... We only want the TLS handshake anyway.
+            Write-VenDebugLog "Ignoring Error: $($_)"
+        }
     }
 
     # find the open network connection then import the raw certificate data 

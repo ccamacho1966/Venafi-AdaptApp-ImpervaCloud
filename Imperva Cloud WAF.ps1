@@ -3,7 +3,7 @@
 #
 # CCamacho Template Driver Version: 202212281725
 #
-$Script:AdaptableAppVer = '202607201742'
+$Script:AdaptableAppVer = '202607281737'
 $Script:AdaptableAppDrv = 'Imperva Cloud WAF'
 
 <#
@@ -19,44 +19,42 @@ You cannot add to, change, or remove the field names. Enable or disable as neede
 -----BEGIN FIELD DEFINITIONS-----
 Text1|Imperva Site ID|101
 Text2|Text Label #2|000
-Text3|Text Label #3|000
-Text4|Text Label #4|000
-Text5|Imperva Cloud WAF Options (APIBody DumpGeneral DumpSpecific UnmaskFields WAFBadRC WAFErrors)|110
-Option1|Debug Imperva Cloud WAF Driver|110
-Option2|Yes/No #2|000
+Text3|Imperva Base Folder|110
+Text4|Imperva Discovered Folder|110
+Text5|Imperva Driver Options|110
+Option1|Debug Imperva Driver|110
+Option2|Discover Sub Accounts|110
 Passwd|Password Field|000
 -----END FIELD DEFINITIONS-----
 
 #>
 
-# Global driver configurations that can't be setup any other way
-
-# These can enable/disable functionality for the discovery driver
-#
-# SubAccounts: Scan for new subaccounts and add them to the policy tree?
-# AddPolicies: Place new subaccount devices in a new policy folder?
-
-$Script:DiscoveryOptions = @{
-    SubAccounts = $true
-    AddPolicies = $true
-}
-
 # These options can be modified by passing in text strings (Text5)
 #
 # APIBody:      Output the masked body of API calls to the debug logs
+# APICalls:     Output REST API calls to the debug logs
+# APIReplyAll:  Output API replies from both Imperva and Venafi
+# APIReplyI:    Output API replies from Imperva
+# APIReplyV:    Output API replies from Venafi
+# CallFunction: Log all calls to functions in the driver
+# Discovered:   Output the list of discovered apps returned to Venafi
 # DumpGeneral:  Output the masked General hashtable to the debug logs
 # DumpSpecific: Output the unredacted Specific hashtable to the debug logs
-# RedactData:   This will mask selected fields in the debug output by default
-#               'UnmaskFields' will set this to false and dump sensitive data
+# UnmaskFields: This will unmask sensitive fields in the debug output
 # WAFErrors:    Log non-fatal WAF errors when retrieving certificates from
 #               the WAF front-end (API Errors are always logged)
 
 $Script:DebugOptions = @{
     APIBody      = $false
-    WAFBadRC     = $false
+    APICalls     = $false
+    APIReplyV    = $false
+    APIReplyI    = $false
+    Discovered   = $false
     DumpGeneral  = $false
     DumpSpecific = $false
+    CallFunction = $false
     RedactData   = $true
+    WAFBadRC     = $false
     WAFErrors    = $false
 }
 
@@ -70,6 +68,9 @@ $Script:SensitiveFields = (
     'Private_Key',
     'Certificate'
 )
+
+# Track Venafi authorization internally to remove VenafiPS dependencies
+$Script:vAuth = $null
 
 # If the website has been moved between subaccounts on Imperva then attempt to just
 # move the application to the correct device rather than throwing a validation error
@@ -117,9 +118,8 @@ function Install-Certificate
         [System.Collections.Hashtable]$Specific
     )
 
+    Set-TlsLevels
     Initialize-VenDebugLog -General $General -Specific $Specific
-
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
     $siteId =$General.VarText1
 
@@ -222,19 +222,17 @@ function Extract-Certificate
         [System.Collections.Hashtable]$General
     )
 
+    Set-TlsLevels
     Initialize-VenDebugLog -General $General
 
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-    $siteId=$General.VarText1
-    Write-VenDebugLog "Imperva Site #$($siteId)"
+    $siteId = $General.VarText1
 
     if ($General.HostAddress -ne '') {
         $wafAccount=$General.HostAddress
     }
 
-    $apiUrl="https://my.imperva.com/api/prov/v1/sites/status"
-    $apiBody="site_id=$($siteId)"
+    $apiUrl  = "https://my.imperva.com/api/prov/v1/sites/status"
+    $apiBody = "site_id=$($siteId)"
 
     try {
         $siteInfo=Invoke-ImpervaRestMethod -General $General -Method Post -Uri $apiUrl -Body $apiBody
@@ -247,8 +245,9 @@ function Extract-Certificate
         "API error $($siteInfo.res): $($siteInfo.debug_info.Error)" | Write-VenDebugLog -ThrowException
     }
 
+    $accountRegex = "^$($wafAccount)$"
     if ($wafAccount) {
-        if ($wafAccount -ne $siteInfo.account_id) {
+        if ($siteInfo.account_id -notmatch $accountRegex) {
             $apiError = "Account Mismatch: Site #$($siteId) expected to be in Account #$($wafAccount), but found in Account #$($siteInfo.account_id) instead."
             Write-VenDebugLog $apiError
             throw $apiError
@@ -256,8 +255,11 @@ function Extract-Certificate
     }
 
     $customCert = Get-ImpervaCustomCertificate -General $General -Website $siteInfo
+    Revoke-VenafiAccessToken
 
-    Write-VenDebugLog "Extracted Thumbprint and Serial Number - Returning control to Venafi"
+    Write-VenDebugLog "[$($siteInfo.display_name)] is Site #$($siteId) in Account #$($siteInfo.account_id)."
+    Write-VenDebugLog "Extracted Thumbprint ($($customCert.fingerprint)) and Serial Number ($($customCert.serialNumber))"
+    Write-VenDebugLog "Success - Returning control to Venafi"
     return @{ Result="Success"; Serial=$($customCert.serialNumber); Thumbprint=$($customCert.fingerprint) }
 }
 
@@ -309,11 +311,21 @@ function Discover-Certificates
     )
  
     $started=Get-Date
-    Initialize-VenDebugLog -General $General
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+    Set-TlsLevels
+    Initialize-VenDebugLog -General $General
 
     # Important constants for the discovery function
+    if (($null -eq $General.VarText4) -or ($General.VarText4.Trim() -eq '')) {
+        # Default folder name is 'Discovered'
+        $DiscoveredFolder = 'Discovered'
+    } elseif ($General.VarText4.Trim() -in ('.','\','.\')) {
+        # Place discovered sub-account devices in the base folder
+        $DiscoveredFolder = ''
+    } else {
+        # Sanitize the provided discovered folder name
+        $DiscoveredFolder = $General.VarText4.Trim() -replace '[^\p{L}\p{Nd} -_]',''
+    }
     $BasicPost = @{
         General = $General
         Method  = 'Post'
@@ -322,35 +334,234 @@ function Discover-Certificates
         Uri     = 'https://my.imperva.com/api/prov/v1/sites/list'
     }
 
-    if (($General.HostAddress -eq '') -or ($General.HostAddress -eq '*')) {
+    # How many objects to pull per API call - maximum supported by Imperva is 100
+    $psize=100
+
+    # Set WAF Account ID and search string
+    if ($General.HostAddress -in ('','*')) {
+        # This indicates the 'flat' style
         $wafAccount = '*'
         $wafSearch  = ''
     } else {
-        $wafAccount = $General.HostAddress
-        $wafSearch  = "account_id=$($wafAccount)&"
-        # Discover sub-accounts if setup correctly
-        if ($Script:DiscoveryOptions.SubAccounts) {
-            $ImpervaUri      = [uri]"https://my.imperva.com/api/prov/v1/accounts/listSubAccounts?account_id=$($wafAccount)"
-            $ImpervaResponse = Invoke-ImpervaRestMethod @BasicPost -Uri $ImpervaUri
-            if ($ImpervaResponse.res -eq 0) {
-                Write-VenDebugLog 'Beginning sub-account discovery'
-                # This is a parent/main account - process subaccounts
-                foreach ($subAccount in $ImpervaResponse.resultList) {
-                    Write-VenDebugLog "Processing sub-account #$($subAccount.sub_account_id): $($subAccount.sub_account_name)"
-                    if ($subAccount.parent_id -eq $wafAccount) {
-                        # valid - search for existing device - no match then create a new one
-                    } else {
-                        Write-VenDebugLog "ERROR: Parent Account is '$($subAccount.parent_id)', expected '$($wafAccount)'... Skipping!"
-                    }
-                }
-                Write-VenDebugLog 'Sub-account discovery complete'
-            }
+        $wafAccount    = $General.HostAddress
+        $wafSearch     = "account_id=$($wafAccount)&"
+        $AccountAPI    = $BasicPost + @{
+            Uri = [uri]"https://my.imperva.com/api/prov/v1/account?account_id=$($wafAccount)"
+        }
+        $SubAccountAPI = $BasicPost + @{
+            Uri = [uri]"https://my.imperva.com/api/prov/v1/accounts/listSubAccounts?account_id=$($wafAccount)"
+        }
+
+        # Grab the account name purely for logging purposes
+        $ImpervaResponse = Invoke-ImpervaRestMethod @AccountAPI
+        if ($ImpervaResponse.res -eq 0) {
+            $AccountNameBadge = " ($($ImpervaResponse.account_name))"
+        }
+
+        # Poll Imperva for list of active sub accounts
+        $ImpervaResponse = Invoke-ImpervaRestMethod @SubAccountAPI
+
+        if ($ImpervaResponse.res -eq 9415) {
+            # Error 9415 Operation is not allowed on this type of account
+            Write-VenDebugLog "Imperva Account# $($wafAccount) is a Sub-Account$($AccountNameBadge)"
+        } elseif ($ImpervaResponse.res -eq 0) {
+            $SubAccountList = $ImpervaResponse.resultList
+            Write-VenDebugLog "Imperva Account# $($wafAccount) is a Parent Account with $($SubAccountList.Count) Sub-Accounts$($AccountNameBadge)"
         }
     }
     $accountRegex = "^$($WafAccount)$"
 
-    # How many sites to pull per API call - maximum supported by Imperva is 100
-    $psize=25
+    # Only perform Venafi device scanning and sub-account work if there are actually sub-accounts in Imperva
+    if ($SubAccountList) {
+        $BaseFolder = $General.VarText3.Trim()
+        # Base Folder must be defined and the sub-account discovery option needs to be enabled
+        if (($BaseFolder) -and ($General.VarBool2 -eq $true)) {
+            # Login to Venafi
+            if ($General|Get-VenafiAccessToken) {
+                # Validate Base Folder Exists (Text3)
+                $cpBody = @{
+                    'ObjectDN' = $BaseFolder
+                }
+                $CheckPolicy = @{
+                    'Method' = 'Post'
+                    'Uri'    = "https://$($Script:vAuth.ApiHost)/vedsdk/Config/IsValid"
+                    'Body'   = $cpBody
+                }
+                try {
+                    $vResponse  = Invoke-VenafiRestMethod @CheckPolicy
+                    $BasePolicy = $vResponse.Object
+                } catch {
+                    # ignore errors
+                }
+                if ($BasePolicy.TypeName -eq 'Policy') {
+                    # Define the Discovered policy folder DN
+                    $DiscoveredFolderDN = "$($BasePolicy.DN)"
+                    if ($DiscoveredFolder) {
+                        $DiscoveredFolderDN += "\$($DiscoveredFolder)"
+                    }
+                    Write-VenDebugLog "Base Policy DN: $($BasePolicy.DN)"
+                    Write-VenDebugLog "Discovered DN: $($DiscoveredFolderDN)"
+
+                    # Gather Sub Account IDs from Devices under the Base Policy
+                    $GetDevicesBody = @{
+                        Class     = 'Device'
+                        ObjectDN  = $BasePolicy.DN
+                        Recursive = 1
+                    }
+                    $GetDevices = @{
+                        Method  = 'Post'
+                        Uri     = "https://$($Script:vAuth.ApiHost)/vedsdk/Config/FindObjectsOfClass"
+                        Body    = $GetDevicesBody
+                    }
+                    try {
+                        $vResponse  = Invoke-VenafiRestMethod @GetDevices
+                        $DeviceList = $vResponse.Objects
+                    } catch {
+                        Write-VenDebugLog "ERROR: Device list lookup failed: $($_)"
+                    }
+
+                    if ($DeviceList.Count) {
+                        Write-VenDebugLog "Found $($DeviceList.Count) Imperva devices in Venafi"
+                        # Grab the "Host" addresses for existing Imperva devices
+                        foreach ($item in $DeviceList) {
+                            $GetHostValueBody = @{
+                                AttributeName = 'Host'
+                                ObjectDN      = $item.DN
+                            }
+                            $GetHostValue = @{
+                                Method = 'Post'
+                                Uri    = "https://$($Script:vAuth.ApiHost)/vedsdk/Config/Read"
+                                Body   = $GetHostValueBody
+                            }
+                            try {
+                                # Lookup the 'Host' attribute for this device in Venafi
+                                $vResponse = Invoke-VenafiRestMethod @GetHostValue
+                            } catch {
+                                Write-VenDebugLog "Host/Account ID lookup failed for device [$($item.Name)]"
+                                continue
+                            }
+                            if (-not $vResponse.Values[0]) {
+                                Write-VenDebugLog "[$($item.Name)] has no Host/Account ID in Venafi"
+                                continue
+                            }
+
+                            # Create a new member property with the Host/Account ID for later use
+                            $item | Add-Member -MemberType NoteProperty -Name 'AccountID' -Value $vResponse.Values[0]
+                        }
+
+                        Write-VenDebugLog 'Beginning Sub-Account Discovery'
+                        # This is a parent/main account - process subaccounts
+                        foreach ($subAccount in $SubAccountList) {
+                            if ($subAccount.parent_id -eq $wafAccount) {
+                                # Check list of sub accounts in Venafi
+                                $vDevice = $DeviceList | Where-Object -Property 'AccountID' -EQ -Value $subAccount.sub_account_id
+
+                                if ($vDevice.Count -gt 1) {
+                                    # Multiple Matches!!!
+                                    Write-VenDebugLog "WARNING: Found multiple ($($vDevice.Count)) device matches for [$($subAccount.sub_account_id): $($subAccount.sub_account_name)]"
+                                    foreach ($item in $vDevice) {
+                                        Write-VenDebugLog ">>>>> $($vDevice.DN)"
+                                    }
+                                } elseif ($vDevice) {
+                                    # Single match found
+                                    Write-VenDebugLog "Mapped [$($subAccount.sub_account_id): $($subAccount.sub_account_name)] to [$($vDevice.DN)]"
+                                } else {
+                                    # Not found - Create new device entry for sub account
+                                    $cpBody = @{
+                                        'ObjectDN' = $DiscoveredFolderDN
+                                    }
+                                    $CheckPolicy.Body = $cpBody
+                                    try {
+                                        $vResponse        = Invoke-VenafiRestMethod @CheckPolicy
+                                        $DiscoveredPolicy = $vResponse.Object
+                                    } catch {
+                                        # Policy does not exist
+                                    }
+                                    if (-not $DiscoveredPolicy) {
+                                        # Create it and populate the policy object
+                                        $CreatePolicyBody = @{
+                                            Class             = 'Policy'
+                                            ObjectDN          = $DiscoveredFolderDN
+                                            NameAttributeList = @{ Description = 'Newly Discovered Imperva Sub-Accounts' }
+                                        }
+                                        $CreatePolicy = @{
+                                            Method = 'Post'
+                                            Uri    = "https://$($Script:vAuth.ApiHost)/vedsdk/Config/Create"
+                                            Body   = $CreatePolicyBody
+                                        }
+                                        try {
+                                            $vResponse        = Invoke-VenafiRestMethod @CreatePolicy
+                                            $DiscoveredPolicy = $vResponse.Object
+                                        } catch {
+                                            # Silently ignore failures and continue
+                                        }
+                                    }
+
+                                    # Keep unicode letters, decimal numbers, and literal spaces - strip anything else from the account name
+                                    $NewDeviceName = "$($subAccount.sub_account_id) $(($subAccount.sub_account_name -replace '[^\p{L}\p{Nd} ]',''))"
+                                    if ($DiscoveredPolicy.TypeName -eq 'Policy') {
+                                        # Create the new Imperva device
+                                        $NewDeviceDN         = "$($DiscoveredPolicy.DN)\$($NewDeviceName)"
+                                        $NewDeviceAttributes = @(
+                                            @{
+                                                Name  = 'Host'
+                                                Value = "$($subAccount.sub_account_id)"
+                                            },
+                                            @{
+                                                Name  = 'Description'
+                                                Value = "$($subAccount.sub_account_name) (ID: $($subAccount.sub_account_id))"
+                                            }
+                                        )
+                                        $CreateDeviceBody    = @{
+                                            Class             = 'Device'
+                                            ObjectDN          = $NewDeviceDN
+                                            NameAttributeList = $NewDeviceAttributes
+                                        }
+                                        $CreateDevice = @{
+                                            Method = 'Post'
+                                            Uri    = "https://$($Script:vAuth.ApiHost)/vedsdk/Config/Create"
+                                            Body   = $CreateDeviceBody
+                                        }
+                                        try {
+                                            $vResponse = Invoke-VenafiRestMethod @CreateDevice
+                                            $NewDevice = $vResponse.Object
+                                        } catch {
+                                            $ErrorMessage = "$($_)"
+                                        }
+
+                                        if ($ErrorMessage) {
+                                            Write-VenDebugLog "Device Creation Failed: $($ErrorMessage)"
+                                        } elseif ($NewDevice) {
+                                            Write-VenDebugLog "New Device Created: $($NewDevice.DN)"
+                                        } else {
+                                            Write-VenDebugLog "NewDevice is NULL for $($NewDeviceDN)"
+                                        }
+                                    } elseif ($DiscoveredPolicy) {
+                                        # This is not a policy... cannot create objects here!
+                                        Write-VenDebugLog "$($DiscoveredPolicy.DN) is not a 'Policy' ($($DiscoveredPolicy.TypeName))"
+                                        Write-VenDebugLog ">>>>> Failed to create new Imperva device [$($NewDeviceName)]"
+                                    } else {
+                                        # No policy or object exists ... creation must have failed
+                                        Write-VenDebugLog "Discovered Policy does not exist"
+                                        Write-VenDebugLog ">>>>> Failed to create new Imperva device [$($NewDeviceName)]"
+                                    }
+                                }
+                            } else {
+                                Write-VenDebugLog "ERROR: Parent Account is '$($subAccount.parent_id)', expected '$($wafAccount)'... Skipping!"
+                            }
+                        }
+                        Write-VenDebugLog 'Sub-account discovery complete'
+                    }
+                } elseif ($BasePolicy.TypeName) {
+                    Write-VenDebugLog "$($BaseFolder) is not a policy ($($BasePolicy.TypeName))"
+                } else {
+                    Write-VenDebugLog "$($BaseFolder) does not exist"
+                }
+            }
+        } elseif ((-not $BaseFolder) -and ($General.VarBool2 -eq $true)) {
+            Write-VenDebugLog "WARNING: Sub-Account discovery requested, but no Base Folder provided"
+        }
+    }
 
     # Initialize counters, arrays, lists
     $page=$siteCount=$sslSites=$sslFree=$sslLegacyAdded=$sslDiscovered=$inactiveSites=0
@@ -400,12 +611,20 @@ function Discover-Certificates
                     $siteList += $wafSite
                 } else { # custom certificate was retrieved
                     $sslFree++
-                    Write-VenDebugLog "Ignored: $($site.display_name) is unencrypted"
+                    Write-VenDebugLog "Ignored: $($site.display_name) is unencrypted or unreachable"
                 } # WAF on an HTTP only site.?! Eeew...
             } # site.account_id matches accountRegex
         } # foreach $site
         $page++
     } while ($batch -eq $psize)
+
+    if ($Script:DebugOptions.Discovered) {
+        Write-VenDebugLog "Discovered Applications List:`n$($siteList|ConvertTo-Json -Depth 9)"
+    }
+
+    # Wait until after the certificate discovery to logout of Venafi because
+    # we may need to search the Venafi database to retrieve the public key
+    Revoke-VenafiAccessToken
 
     if ($sslDiscovered+$sslLegacyAdded -gt 0) {
         $logMessage = "Discovered $($sslDiscovered+$sslLegacyAdded) secure sites"
@@ -476,9 +695,11 @@ function Initialize-VenDebugLog
         [System.Collections.Hashtable]$Specific = $null
     )
 
+    $Caller = (Get-PSCallStack)[1].Command
+
     # if the debugfile is already setup we shouldn't be called again - log a warning
     if ($null -ne $Script:venDebugFile) {
-        Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
+        Write-VenDebugLog "Called by $($Caller)"
         Write-VenDebugLog 'WARNING: Initialize-VenDebugLog() called more than once!'
         return
     }
@@ -496,21 +717,27 @@ function Initialize-VenDebugLog
 
     # add a filename to the base log directory path
     $Script:venDebugFile = "$($logPath)\$($Script:AdaptableAppDrv.Replace(' ',''))"
-    if ($General.HostAddress -ne '') {
+    if ($General.HostAddress -notin ('*','')) {
         $Script:venDebugFile += "-Acct$($General.HostAddress)"
+    }
+    if ($Caller -eq 'Discover-Certificates') {
+        $Script:venDebugFile += '-Discovery'
     }
     $Script:venDebugFile += ".log"
     
     Write-Output '' | Add-Content -Path $Script:venDebugFile
 
-    Write-VenDebugLog -NoFunctionTag -LogMessage "$($Script:AdaptableAppDrv) v$($Script:AdaptableAppVer): Venafi called $((Get-PSCallStack)[1].Command)"
+    Write-VenDebugLog -NoFunctionTag -LogMessage "$($Script:AdaptableAppDrv) v$($Script:AdaptableAppVer): Venafi called $($Caller)"
     Write-VenDebugLog -NoFunctionTag -LogMessage "PowerShell Environment: $($PSVersionTable.PSEdition) Edition, Version $($PSVersionTable.PSVersion.Major)"
-
-    Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
 
     # Process advanced debug options
     if ($General.VarText5) {
         $AdvDebugOptions = $General.VarText5.Trim() -split "[ ,|]" | Where-Object -FilterScript { $_ }
+        if ($AdvDebugOptions -contains 'CallFunction') {
+            Write-VenDebugLog "Called by $($Caller)"
+            Write-VenDebugLog "Advanced Debug: Function calls will be output to the debug logs"
+            $Script:DebugOptions.CallFunction = $true
+        }
         if ($AdvDebugOptions -contains 'UnmaskFields') {
             Write-VenDebugLog "Advanced Debug: Sensitive fields will not be redacted (UnmaskFields)"
             $Script:DebugOptions.RedactData = $false
@@ -518,6 +745,28 @@ function Initialize-VenDebugLog
         if ($AdvDebugOptions -contains 'APIBody') {
             Write-VenDebugLog "Advanced Debug: API body will be output to the debug logs"
             $Script:DebugOptions.APIBody = $true
+        }
+        if ($AdvDebugOptions -contains 'APICalls') {
+            Write-VenDebugLog "Advanced Debug: API calls will be output to the debug logs"
+            $Script:DebugOptions.APICalls = $true
+        }
+        if ($AdvDebugOptions -contains 'APIReplyAll') {
+            Write-VenDebugLog "Advanced Debug: All API replies will be output to the debug logs"
+            $Script:DebugOptions.APIReplyI = $true
+            $Script:DebugOptions.APIReplyV = $true
+        } else {
+            if ($AdvDebugOptions -contains 'APIReplyI') {
+                Write-VenDebugLog "Advanced Debug: Imperva API replies will be output to the debug logs"
+                $Script:DebugOptions.APIReplyI = $true
+            }
+            if ($AdvDebugOptions -contains 'APIReplyV') {
+                Write-VenDebugLog "Advanced Debug: Venafi API replies will be output to the debug logs"
+                $Script:DebugOptions.APIReplyV = $true
+            }
+        }
+        if ($AdvDebugOptions -contains 'Discovered') {
+            Write-VenDebugLog "Advanced Debug: Discovered app list will be output to the debug logs"
+            $Script:DebugOptions.Discovered = $true
         }
         if ($AdvDebugOptions -contains 'WAFErrors') {
             Write-VenDebugLog "Advanced Debug: Non-fatal WAF errors will be output to the debug logs"
@@ -527,7 +776,12 @@ function Initialize-VenDebugLog
             Write-VenDebugLog "Advanced Debug: Including dump of variables from the GENERAL hashtable"
             $RedactedData = $General|Remove-RedactedValues
             foreach ($key in ($RedactedData.Keys|Sort-Object)) {
-                Add-Content -Path $Script:venDebugFile ">>>>> $($key): $($RedactedData[$key])"
+                if ($null -eq $RedactedData[$key]) {
+                    $keytype = 'NULL'
+                } else {
+                    $keytype = $RedactedData[$key].GetType()
+                }
+                Add-Content -Path $Script:venDebugFile ">>>>> $($key)[$($keytype)]: [$($RedactedData[$key])]"
             }
         }
         if ($AdvDebugOptions -contains 'DumpSpecific') {
@@ -536,7 +790,12 @@ function Initialize-VenDebugLog
                 # Specific hashtable is never redacted - nothing would be left to log!
                 $RedactedData = $Specific
                 foreach ($key in ($RedactedData.Keys|Sort-Object)) {
-                    Add-Content -Path $Script:venDebugFile ">>>>> $($key): $($RedactedData[$key])"
+                    if ($null -eq $RedactedData[$key]) {
+                        $keytype = 'NULL'
+                    } else {
+                        $keytype = $RedactedData[$key].GetType()
+                    }
+                    Add-Content -Path $Script:venDebugFile ">>>>> $($key)[$($keytype)]: [$($RedactedData[$key])]"
                 }
             }
         }
@@ -547,8 +806,12 @@ function Remove-RedactedValues
 {
     Param(
         [Parameter(Mandatory,ValueFromPipeline,Position=0)]
-        [System.Collections.Hashtable] $InputObject
+        [System.Object] $InputObject
     )
+
+    if ($Script:DebugOptions.CallFunction) {
+        Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
+    }
 
     # Return the original object if sensitive data is not being redacted
     if (-not $Script:DebugOptions.RedactData) {
@@ -556,25 +819,40 @@ function Remove-RedactedValues
         return $InputObject
     }
 
-    # Return the original object if object is not a hashtable
-    if ($InputObject.GetType().Name -ne 'Hashtable') {
-        Write-VenDebugLog "not a hashtable (type: $($InputObject.GetType().Name))"
+    $i=0
+    if ($InputObject.GetType().Name -eq 'Hashtable') {
+        # Create a shallow copy of the hashtable
+        $RedactedData = $InputObject.Clone()
+
+        # Mask sensitive values in the COPY of the input object
+        foreach ($key in $InputObject.keys) {
+            if ($key -in $Script:SensitiveFields) {
+                if ($InputObject[$key]) {
+                    $i++
+                    $RedactedData[$key] = '<<<REDACTED>>>'
+                }
+            }
+        }
+    } elseif ($InputObject.GetType().Name -eq 'PSCustomObject') {
+        # Use JSON conversions to force a reasonably accurate copy
+        $RedactedData = $InputObject|ConvertTo-Json -Depth 9|ConvertFrom-Json
+
+        # Mask sensitive values in the COPY of the input object
+        foreach ($property in $InputObject.psobject.Properties) {
+            if ($property.Name -in $Script:SensitiveFields) {
+                if ($InputObject.($property.Name)) {
+                    $i++
+                    $RedactedData.($property.Value) = '<<<REDACTED>>>'
+                }
+            }
+        }
+    } else {
+        # Return the original object if not a hashtable or PSCustomObject
+        Write-VenDebugLog "not a hashtable or pscustomobject (type: $($InputObject.GetType().Name))"
         return $InputObject
     }
 
-    # Create a shallow copy of the input object
-    $RedactedData = $InputObject.Clone()
-
-    # Mask sensitive values in the COPY of the input object
-    $i=0
-    foreach ($key in $InputObject.keys) {
-        if ($key -in $Script:SensitiveFields) {
-            if ($InputObject[$key]) {
-                $i++
-                $RedactedData[$key] = '<<<REDACTED>>>'
-            }
-        }
-    }
+    # Log how many fields have been redacted
     if ($i) {
         if ($i -gt 1) { $s = 's' } else { $s = '' }
         Write-VenDebugLog "Redacted $($i) field$($s)"
@@ -582,6 +860,54 @@ function Remove-RedactedValues
 
     # Return the redacted copy of the original object
     $RedactedData
+}
+
+function Set-TlsLevels
+{
+    param(
+        [Parameter()]
+        [ValidateSet('TLS10','TLS11')]
+        [String[]] $Include,
+
+        [Parameter()]
+        [ValidateSet('TLS12','TLS13')]
+        [String[]] $Exclude
+    )
+
+    # Always disable SSL v3
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -band (-bnot [Net.SecurityProtocolType]::Ssl3)
+
+    if ($Include -contains 'TLS10') {
+        # Enable TLS 1.0
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls
+    } else {
+        # Disable TLS 1.0 by default
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -band (-bnot [Net.SecurityProtocolType]::Tls)
+    }
+
+    if ($Include -contains 'TLS11') {
+        # Enable TLS 1.1
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls11
+    } else {
+        # Disable TLS 1.1 by default
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -band (-bnot [Net.SecurityProtocolType]::Tls11)
+    }
+
+    if ($Exclude -contains 'TLS12') {
+        # Disable TLS 1.2
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -band (-bnot [Net.SecurityProtocolType]::Tls12)
+    } else {
+        # Enable TLS 1.2 by default
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    }
+
+    if ($Exclude -contains 'TLS13') {
+        # Disable TLS 1.3
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -band (-bnot [Net.SecurityProtocolType]::Tls13)
+    } else {
+        # Enable TLS 1.3 by default
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls13
+    }
 }
 
 function Invoke-ImpervaRestMethod
@@ -603,7 +929,9 @@ function Invoke-ImpervaRestMethod
 		[int] $TimeoutSec
 	)
 
-    Write-VenDebugLog "$((Get-PSCallStack)[1].Command)/$($Method) as API-ID $($General.UserName): $($Uri)"
+    if ($Script:DebugOptions.APICalls -or $Script:DebugOptions.CallFunction) {
+        Write-VenDebugLog "$((Get-PSCallStack)[1].Command)/$($Method) as API-ID $($General.UserName): $($Uri)"
+    }
 
     $apiAuth = @{
         'x-API-Id'  = $General.UserName;
@@ -641,6 +969,9 @@ function Invoke-ImpervaRestMethod
     do {
         try {
             $response = Invoke-RestMethod @ImpervaRestApiCall
+            if ($Script:DebugOptions.ApiReplyI) {
+                Write-VenDebugLog "API Reply:`n$($response|Remove-RedactedValues|ConvertTo-Json -Depth 9)"
+            }
         } catch {
             $ErrorResults = "$($_)" | ConvertFrom-Json
             if ($null -ne $ErrorResults.res) {
@@ -701,6 +1032,10 @@ function Convert-ImpervaTimestamp
         [String]$Timestamp
     )
 
+    if ($Script:DebugOptions.CallFunction) {
+        Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
+    }
+
     # Convert microseconds to seconds and add to 'epoch' date
     ([DateTime]'1/1/1970Z').AddSeconds($Timestamp/1000)
 }
@@ -712,7 +1047,9 @@ function Get-ImpervaCustomCertificate
         [Parameter(Mandatory)] [PSCustomObject] $Website
     )
 
-    Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
+    if ($Script:DebugOptions.CallFunction) {
+        Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
+    }
 
     $Attempts=3
     $siteId     = $Website.site_id
@@ -864,21 +1201,25 @@ function Get-CertFromWaf
         [string]$Port='443'
     )
 
-    Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
-    Write-VenDebugLog "Pulling certificate for $($Target) via front-end $($WafHost)"
+    if ($Script:DebugOptions.CallFunction) {
+        Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
+        Write-VenDebugLog "Pulling certificate for $($Target) via front-end $($WafHost)"
+    }
 
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls12
     $wafUri = "https://$($WafHost):$($Port)"
 
     try {
         # open a network connection to the Imperva front-end. Be sure to pass the proper host request header!
         # We're not parsing the webpage so '-UseBasicParsing' helps prevent meaningless IE setup errors messages...
+        Set-TlsLevels -Include TLS10,TLS11
         Invoke-WebRequest -Uri "$($wafUri)" -Headers @{Host="$($Target)"} -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop | Out-Null
     } catch {
         if ($Script:DebugOptions.WAFErrors) {
             # Log the error but keep on trucking... We only want the TLS handshake anyway.
             Write-VenDebugLog "Ignoring Error: $($_)"
         }
+    } finally {
+        Set-TlsLevels
     }
 
     # find the open network connection then import the raw certificate data 
@@ -886,7 +1227,7 @@ function Get-CertFromWaf
 
     # failure was so complete that no certificate was returned by the front-end!!
     if (-not $sp.Certificate) {
-        Write-VenDebugLog "FAILED to pull certificate for $($Target) from $($WafHost)"
+#        Write-VenDebugLog "FAILED to pull certificate for $($Target) from $($WafHost)"
         return
     }
 
@@ -895,7 +1236,7 @@ function Get-CertFromWaf
 
     # create a base-64 formatted string from the certificate (aka PEM data format)
     $pemData = [Convert]::ToBase64String($wafCert.GetRawCertData(),'InsertLineBreaks')
-    $FormattedPEM = "-----BEGIN CERTIFICATE-----`n$($pemData)`n-----END CERTIFICATE-----"
+    $FormattedPEM = "-----BEGIN CERTIFICATE-----`n$($pemData -replace "`r`n","`n")`n-----END CERTIFICATE-----"
 
     # build an object that contains both the certificate object and PEM string data
     $results = @{
@@ -906,6 +1247,7 @@ function Get-CertFromWaf
     $results
 }
 
+#region FindVenafiCert
 function Find-CertInVenafi
 {
     Param(
@@ -919,16 +1261,182 @@ function Find-CertInVenafi
         [string]$Thumbprint
     )
 
-    Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
+    if ($Script:DebugOptions.CallFunction) {
+        Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
+        Write-VenDebugLog "Search the vault for SN: $($SerialNumber)"
+    }
 
-    # Create Venafi credential object
-    $vUser = $General.AuxUser.Trim()
-    if (-not $vUser) {
+    # Get an access token for Venafi or abort immediately
+    if (-not ($General|Get-VenafiAccessToken)) { return }
+
+    $vSearchBody = @{
+        Name        = 'Serial'
+        StringValue = $SerialNumber
+    }
+    $vSearchParms = @{
+        Method = 'Post'
+        Uri    = "https://$($Script:vAuth.ApiHost)/vedsdk/SecretStore/LookupByAssociation"
+        Body   = $vSearchBody
+    }
+    try {
+        $vSearchReply = Invoke-VenafiRestMethod @vSearchParms
+        if ($vSearchReply.Result -ne 0) {
+            Write-VenDebugLog "Vault ID Lookup Failure (RC=$($vSearchReply.Result)): $($vSearchReply.Error)"
+            return
+        }
+    } catch {
+        Write-VenDebugLog "Vault ID Lookup Failure: $($_)"
+        return
+    }
+
+    # This should be modified to loop in case multiple results are returned...
+    $VaultID = $vSearchReply.VaultIDs[0]
+
+    if (-not $VaultID) {
+        Write-VenDebugLog "Could not find a certificate with Serial# $($SerialNumber) in Venafi vault"
+        return
+    }
+
+    $vGetCert = @{
+        'ContentType' = 'application/json'
+        'Method'       = 'Get'
+        'Uri'          = "https://$($Script:vAuth.ApiHost)/vedsdk/Certificates/Retrieve/$($VaultID)?Format=Base64"
+    }
+    Write-VenDebugLog "Retrieving Certificate from the Venafi vault (ID $($VaultID))"
+    $CertPEM = Invoke-VenafiRestMethod @vGetCert
+
+    # Convert PEM formatted certificate to a Base64 encoded string without line breaks
+    $CertB64 = (($CertPEM -split '\r?\n' | Where-Object { $_ -notmatch 'BEGIN|END' }) -join '')
+
+    # Convert Base64 encoded string into raw binary bytes
+    $CertRaw = [System.Convert]::FromBase64String($CertB64)
+
+    # Convert byte array into an X509Certificate2 object
+    $CertObj = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CertRaw)
+
+
+    if ($CertObj.Thumbprint -ne $Thumbprint) {
+        Write-VenDebugLog "Vault ID #$($VaultID) - Thumbprint mismatch (Looking for $($Thumbprint) but found $($CertObj.Thumbprint))"
+        return
+    }
+
+    # build an object that contains both the certificate object and PEM string data
+    $results = @{
+        X509   = $CertObj
+        PEM    = ($CertPEM -replace "`r`n","`n")
+    }
+
+    $results
+}
+#endregion
+
+#region Venafi REST API
+function Invoke-VenafiRestMethod
+{
+	Param(
+		[Parameter(Mandatory)]
+        [Uri] $Uri,
+
+		[Parameter(Mandatory)]
+        [Microsoft.PowerShell.Commands.WebRequestMethod] $Method,
+
+		[System.Object] $Body,
+
+		[string] $ContentType = 'application/json',
+
+		[int] $TimeoutSec,
+
+        [switch] $NoAuth
+	)
+
+    if ($Script:DebugOptions.APICalls -or $Script:DebugOptions.CallFunction) {
+        if ($NoAuth) {
+            $WhoAmI = '[nobody]'
+        } else {
+            $WhoAmI = $Script:vAuth.username
+        }
+        Write-VenDebugLog "$((Get-PSCallStack)[1].Command)/$($Method) as $($WhoAmI): $($Uri)"
+    }
+
+    if ((-not $NoAuth) -and (-not $Script:vAuth.access_token)) {
+        Write-VenDebugLog 'No Access Token: API OAUTH token must be created before calling this function'
+        return
+    }
+
+    $VenafiRestApiCall = @{
+        Uri         = $Uri
+        Method      = $Method
+        ContentType = $ContentType
+    }
+
+    if ((-not $NoAuth) -and ($Script:vAuth.Headers)) {
+        $VenafiRestApiCall.Headers = $Script:vAuth.Headers
+    }
+
+    # Convert body hashtable to JSON and optionally log the possibly redacted result
+    if ($Body)       {
+        if ($Body.GetType().Name -eq 'Hashtable') {
+            # Convert the hashtable to JSON
+            $VenafiRestApiCall.Body        = ($Body|ConvertTo-Json -Depth 9)
+            if ($Script:DebugOptions.APIBody) {
+                # Log the possibly redacted body json
+                Write-VenDebugLog "API Call Body:`n$($Body|Remove-RedactedValues|ConvertTo-Json -Depth 9)"
+            }
+        } else {
+            $VenafiRestApiCall.Body        = $Body
+            if ($Script:DebugOptions.APIBody) {
+                # Log the raw body string (cannot be redacted)
+                Write-VenDebugLog "API Call Body: $($Body)"
+            }
+        }
+    }
+    if ($TimeoutSec) { $VenafiRestApiCall.TimeoutSec = $TimeoutSec }
+
+    try {
+        $response = Invoke-RestMethod @VenafiRestApiCall
+        if ($Script:DebugOptions.ApiReplyV) {
+            Write-VenDebugLog "API Reply:`n$($response|Remove-RedactedValues|ConvertTo-Json -Depth 9)"
+        }
+    } catch {
+        # Do nothing on error
+    }
+
+    # Return the API response
+    $response
+}
+#endregion
+
+#region Venafi Tokens
+function Get-VenafiAccessToken
+{
+    Param(
+        [Parameter(Mandatory,ValueFromPipeline)]
+        [System.Collections.Hashtable] $General
+    )
+
+    if ($Script:DebugOptions.CallFunction) {
+        Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
+    }
+
+    # Do nothing if access token is already defined
+    if ($Script:vAuth.access_token) {
+        $true
+        return
+    }
+
+    # Verify that an Aux User has been defined for Venafi API access
+    if (-not ($General.AuxUser.Trim())) {
         Write-VenDebugLog "No auxilliary user defined - cannot access Venafi API"
         return
     }
-    $vPass = ConvertTo-SecureString $General.AuxPass.Trim() -AsPlainText -Force
-    $vCred = New-Object System.Management.Automation.PSCredential($vUser, $vPass)
+
+    # Venafi API login body
+    $vAuthBody = @{
+        username  = $General.AuxUser.Trim()
+        password  = $General.AuxPass.Trim()
+        client_id = 'imperva'
+        scope     = 'certificate:manage;configuration:manage;restricted:manage'
+    }
 
     # Venafi API hostname defaults to the FQDN of the localhost
     $apiHost = $env:COMPUTERNAME
@@ -943,55 +1451,61 @@ function Find-CertInVenafi
         Write-VenDebugLog "Couldn't resolve API hostname $($env:COMPUTERNAME)"
         return
     }
-    $vParms = @{
-        Server = $vApi
-        Credential = $vCred
-        ClientId = 'imperva'
-        Scope = @{ certificate='manage'; configuration='manage'; restricted='manage' }
+
+    # Venafi API login parameters (OAUTH)
+    $vAuthParms = @{
+        Method = 'Post'
+        NoAuth = $true
+        Uri    = "https://$($vApi)/vedauth/authorize/oauth"
+        Body   = $vAuthBody
     }
+
+    # Get an OAUTH token from Venafi
     try {
-        $vSession = New-VenafiSession @vParms -PassThru
-        if (-not $vSession) {
-            throw "VenafiSession is NULL"
+        $vAuthReply = Invoke-VenafiRestMethod @vAuthParms
+        if (-not $vAuthReply.access_token) {
+            Write-VenDebugLog "Access Token is NULL"
+            return
         }
     } catch {
         Write-VenDebugLog "Venafi Login Failure: $($_)"
         return
     }
-    Write-VenDebugLog "Searching the vault for SN: $($SerialNumber)"
-    try {
-        $VaultID = Find-TppVaultId -Attribute @{'Serial'=$SerialNumber} -VenafiSession $vSession
-    } catch {
-        Write-VenDebugLog "Vault ID Lookup Failure: $($_)"
-    }
 
-    if (-not $VaultID) {
-        Write-VenDebugLog "Could not find certificate in Venafi vault"
-        Revoke-TppToken -VenafiSession $vSession -Force
-        return
-    }
+    $vAuthReply | Add-Member -MemberType NoteProperty -Name Headers   -Value @{ Authorization = "Bearer $($vAuthReply.access_token)" }
+    $vAuthReply | Add-Member -MemberType NoteProperty -Name ApiHost   -Value $vApi
+    $vAuthReply | Add-Member -MemberType NoteProperty -Name username  -Value $vAuthBody.username
+    $vAuthReply | Add-Member -MemberType NoteProperty -Name password  -Value $vAuthBody.password
+    $vAuthReply | Add-Member -MemberType NoteProperty -Name client_id -Value $vAuthBody.client_id
+    $Script:vAuth = $vAuthReply
 
-    Write-VenDebugLog "Retrieving Certificate from the Venafi vault (ID $($VaultID))"
-    [byte[]]$rawCert = Invoke-VenafiRestMethod -Method Get -UriLeaf "Certificates/Retrieve/$($VaultID)?Format=Base64" -VenafiSession $vSession
-    Revoke-TppToken -VenafiSession $vSession -Force
-    $wafCert = [System.Security.Cryptography.X509Certificates.X509Certificate2]($rawCert)
+#    Write-VenDebugLog "vAuth:`n$($Script:vAuth|ConvertTo-Json)"
 
-    if ($wafCert.Thumbprint -ne $Thumbprint) {
-        Write-VenDebugLog "Vault ID #$($VaultID) - Thumbprint mismatch (Looking for $($Thumbprint) but found $($wafCert.Thumbprint))"
-        return
-    }
-
-    # create a base-64 formatted string from the certificate (aka PEM data format)
-    $pemData = [Convert]::ToBase64String($wafCert.GetRawCertData(),'InsertLineBreaks')
-    $FormattedPEM = "-----BEGIN CERTIFICATE-----`n$($pemData)`n-----END CERTIFICATE-----"
-
-    # build an object that contains both the certificate object and PEM string data
-    $results = @{
-        X509   = $wafCert
-        PEM    = $FormattedPem
-    }
-
-    $results
+    # return $true upon success
+    $true
 }
+
+function Revoke-VenafiAccessToken
+{
+    if ($Script:DebugOptions.CallFunction) {
+        Write-VenDebugLog "Called by $((Get-PSCallStack)[1].Command)"
+    }
+
+    # Do nothing if no access token is defined
+    if (-not $Script:vAuth.access_token) { return }
+
+    $vRevoke = @{
+        'ContentType' = 'application/json'
+        'Method'      = 'Get'
+        'Uri'         = "https://$($Script:vAuth.ApiHost)/vedauth/Revoke/token"
+    }
+
+    try {
+        Invoke-VenafiRestMethod @vRevoke | Out-Null
+    } catch {
+        # Ignore errors
+    }
+}
+#endregion
 
 # END OF SCRIPT

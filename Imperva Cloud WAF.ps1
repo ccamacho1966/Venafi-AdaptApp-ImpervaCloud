@@ -1,9 +1,7 @@
 ﻿#
 # Imperva Cloud WAF - An Adaptable Application Driver for Venafi
 #
-# CCamacho Template Driver Version: 202212281725
-#
-$Script:AdaptableAppVer = '202607281737'
+$Script:AdaptableAppVer = '202608111632'
 $Script:AdaptableAppDrv = 'Imperva Cloud WAF'
 
 <#
@@ -32,8 +30,10 @@ Passwd|Password Field|000
 # These options can be modified by passing in text strings (Text5)
 #
 # APIBody:      Output the masked body of API calls to the debug logs
-# APICalls:     Output REST API calls to the debug logs
-# APIReplyAll:  Output API replies from both Imperva and Venafi
+# APICalls:     Output REST API calls for both Imperva and Venafi
+# APICallI:     Output REST API calls for Imperva
+# APICallV:     Output REST API calls for Venafi
+# APIReplies:   Output API replies from both Imperva and Venafi
 # APIReplyI:    Output API replies from Imperva
 # APIReplyV:    Output API replies from Venafi
 # CallFunction: Log all calls to functions in the driver
@@ -46,7 +46,8 @@ Passwd|Password Field|000
 
 $Script:DebugOptions = @{
     APIBody      = $false
-    APICalls     = $false
+    APICallV     = $false
+    APICallI     = $false
     APIReplyV    = $false
     APIReplyI    = $false
     Discovered   = $false
@@ -128,9 +129,6 @@ function Install-Certificate
 
     $certB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($rawCert.Replace("`r`n","`n")))
     $keyB64  = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($rawKey.Replace("`r`n","`n")))
-
-    # v1 API - deprecated 1-Nov-2024
-    # $apiUrl ="https://my.imperva.com/api/prov/v1/sites/customCertificate/upload"
 
     # v2 API - custom certificate management
     $apiUrl  = "https://my.imperva.com/api/prov/v2/sites/$($siteId)/customCertificate"
@@ -534,7 +532,7 @@ function Discover-Certificates
                                         } elseif ($NewDevice) {
                                             Write-VenDebugLog "New Device Created: $($NewDevice.DN)"
                                         } else {
-                                            Write-VenDebugLog "NewDevice is NULL for $($NewDeviceDN)"
+                                            Write-VenDebugLog "Device Creation Failed: $($NewDeviceDN)"
                                         }
                                     } elseif ($DiscoveredPolicy) {
                                         # This is not a policy... cannot create objects here!
@@ -747,8 +745,18 @@ function Initialize-VenDebugLog
             $Script:DebugOptions.APIBody = $true
         }
         if ($AdvDebugOptions -contains 'APICalls') {
-            Write-VenDebugLog "Advanced Debug: API calls will be output to the debug logs"
-            $Script:DebugOptions.APICalls = $true
+            Write-VenDebugLog "Advanced Debug: All API calls will be output to the debug logs"
+            $Script:DebugOptions.APICallI = $true
+            $Script:DebugOptions.APICallV = $true
+        } else {
+            if ($AdvDebugOptions -contains 'APICallI') {
+                Write-VenDebugLog "Advanced Debug: Imperva API calls will be output to the debug logs"
+                $Script:DebugOptions.APICallI = $true
+            }
+            if ($AdvDebugOptions -contains 'APICallV') {
+                Write-VenDebugLog "Advanced Debug: Venafi API calls will be output to the debug logs"
+                $Script:DebugOptions.APICallV = $true
+            }
         }
         if ($AdvDebugOptions -contains 'APIReplyAll') {
             Write-VenDebugLog "Advanced Debug: All API replies will be output to the debug logs"
@@ -929,7 +937,7 @@ function Invoke-ImpervaRestMethod
 		[int] $TimeoutSec
 	)
 
-    if ($Script:DebugOptions.APICalls -or $Script:DebugOptions.CallFunction) {
+    if ($Script:DebugOptions.APICallI -or $Script:DebugOptions.CallFunction) {
         Write-VenDebugLog "$((Get-PSCallStack)[1].Command)/$($Method) as API-ID $($General.UserName): $($Uri)"
     }
 
@@ -1349,7 +1357,7 @@ function Invoke-VenafiRestMethod
         [switch] $NoAuth
 	)
 
-    if ($Script:DebugOptions.APICalls -or $Script:DebugOptions.CallFunction) {
+    if ($Script:DebugOptions.APICallV -or $Script:DebugOptions.CallFunction) {
         if ($NoAuth) {
             $WhoAmI = '[nobody]'
         } else {
